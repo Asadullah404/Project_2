@@ -5,7 +5,7 @@ import importlib.util
 # --- Package Installation ---
 REQUIRED_PACKAGES = [
     'PyQt5', 'torch', 'torchaudio', 'numpy', 'pyaudio', 
-    'scipy', 'librosa', 'matplotlib', 'pystoi', 'pesq', 'soundfile'
+    'scipy', 'librosa', 'matplotlib', 'pystoi', 'pesq', 'soundfile', 'dac'
 ]
 
 def check_and_install_packages():
@@ -14,21 +14,26 @@ def check_and_install_packages():
     for package in REQUIRED_PACKAGES:
         module_name = package
         if package == 'PyQt5': module_name = 'PyQt5'
-        if package == 'pystoi': module_name = 'pystoi' # a.k.a. pystoi-rec
+        if package == 'pystoi': module_name = 'pystoi'
         if package == 'pesq': module_name = 'pesq'
+        if package == 'dac': module_name = 'dac'
 
         spec = importlib.util.find_spec(module_name)
         if spec is None:
             print(f"Package '{package}' not found. Attempting to install...")
             try:
-                # Special case for pesq which needs a specific version for 'wb'
                 if package == 'pesq':
                     subprocess.check_call([sys.executable, "-m", "pip", "install", "pesq[speechmetrics]"])
+                elif package == 'dac':
+                    subprocess.check_call([sys.executable, "-m", "pip", "install", "descript-audio-codec"])
                 else:
                     subprocess.check_call([sys.executable, "-m", "pip", "install", package])
                 print(f"Successfully installed '{package}'.")
             except subprocess.CalledProcessError as e:
                 print(f"ERROR: Failed to install '{package}'. Please install it manually. Error: {e}")
+                sys.exit(1)
+            except Exception as e:
+                print(f"ERROR: An unexpected error occurred during installation of '{package}'. Error: {e}")
                 sys.exit(1)
         else:
             print(f"{package} is already installed.")
@@ -51,8 +56,8 @@ class MainWindow(QMainWindow):
     """The main application window which holds the tabbed interface."""
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Low-Latency Neural Audio Codec (< 20ms, 16kbps)")
-        self.setGeometry(100, 100, 900, 700)
+        self.setWindowTitle("Ultra Low-Latency Adversarial Audio Codec (10ms, 16kbps)")
+        self.setGeometry(100, 100, 950, 700)
 
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
@@ -66,7 +71,7 @@ class MainWindow(QMainWindow):
         self.evaluation_tab = EvaluationTab()
 
         self.tabs.addTab(self.training_tab, "Training")
-        self.tabs.addTab(self.streaming_tab, "Real-Time Streaming (20ms)")
+        self.tabs.addTab(self.streaming_tab, "Real-Time Streaming (10ms Frame)")
         self.tabs.addTab(self.evaluation_tab, "Model Evaluation")
         
     def closeEvent(self, event):
@@ -81,4 +86,3 @@ if __name__ == '__main__':
     main_window = MainWindow()
     main_window.show()
     sys.exit(app.exec_())
-

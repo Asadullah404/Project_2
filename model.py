@@ -1,2554 +1,3 @@
-# # # # import torch
-# # # # import torch.nn as nn
-# # # # import torch.optim as optim
-# # # # from torch.utils.data import Dataset, DataLoader
-# # # # import torchaudio
-# # # # import os
-# # # # import numpy as np
-# # # # import torch.nn.functional as F
-# # # # import math
-
-# # # # # --- Perceptual Loss Function ---
-# # # # class MultiResolutionSTFTLoss(nn.Module):
-# # # #     """
-# # # #     Multi-resolution STFT loss, common in audio generation models.
-# # # #     This is a key part of achieving high quality (PESQ/STOI).
-# # # #     """
-# # # #     def __init__(self, fft_sizes=[1024, 2048, 512], hop_sizes=[120, 240, 50], win_lengths=[600, 1200, 240]):
-# # # #         super(MultiResolutionSTFTLoss, self).__init__()
-# # # #         self.fft_sizes = fft_sizes
-# # # #         self.hop_sizes = hop_sizes
-# # # #         self.win_lengths = win_lengths
-# # # #         self.window = torch.hann_window
-# # # #         assert len(fft_sizes) == len(hop_sizes) == len(win_lengths)
-
-# # # #     def forward(self, y_hat, y):
-# # # #         sc_loss, mag_loss = 0.0, 0.0
-# # # #         for fft, hop, win in zip(self.fft_sizes, self.hop_sizes, self.win_lengths):
-# # # #             window = self.window(win, device=y.device)
-# # # #             spec_hat = torch.stft(y_hat.squeeze(1), n_fft=fft, hop_length=hop, win_length=win, window=window, return_complex=True)
-# # # #             spec = torch.stft(y.squeeze(1), n_fft=fft, hop_length=hop, win_length=win, window=window, return_complex=True)
-            
-# # # #             sc_loss += torch.norm(torch.abs(spec) - torch.abs(spec_hat), p='fro') / torch.norm(torch.abs(spec), p='fro')
-# # # #             mag_loss += F.l1_loss(torch.log(torch.abs(spec).clamp(min=1e-9)), torch.log(torch.abs(spec_hat).clamp(min=1e-9)))
-            
-# # # #         return (sc_loss / len(self.fft_sizes)) + (mag_loss / len(self.fft_sizes))
-
-# # # # # --- Causal Convolution ---
-# # # # class CausalConv1d(nn.Conv1d):
-# # # #     """
-# # # #     A 1D convolution that is causal (cannot see the future).
-# # # #     This is critical for the < 20ms latency goal.
-# # # #     """
-# # # #     def __init__(self, *args, **kwargs):
-# # # #         super().__init__(*args, **kwargs)
-# # # #         # Calculate the padding needed to make it causal
-# # # #         self.causal_padding = self.kernel_size[0] - 1
-
-# # # #     def forward(self, x):
-# # # #         # Pad on the left (past) only
-# # # #         return super().forward(F.pad(x, (self.causal_padding, 0)))
-
-# # # # class CausalConvTranspose1d(nn.ConvTranspose1d):
-# # # #     """
-# # # #     A 1D *transpose* convolution that is causal.
-# # # #     It removes output samples that would "see the future".
-# # # #     """
-# # # #     def __init__(self, *args, **kwargs):
-# # # #         super().__init__(*args, **kwargs)
-# # # #         self.causal_padding = self.kernel_size[0] - self.stride[0]
-
-# # # #     def forward(self, x):
-# # # #         x = super().forward(x)
-# # # #         # Remove the invalid, "future-seeing" samples from the end
-# # # #         if self.causal_padding != 0:
-# # # #             return x[..., :-self.causal_padding]
-# # # #         return x
-
-# # # # # --- Vector Quantizer (The heart of the *COMPRESSION*) ---
-# # # # class VectorQuantizer(nn.Module):
-# # # #     """
-# # # #     The Vector Quantizer (VQ) module. This is what enables low-bitrate compression.
-# # # #     It maps continuous latent vectors to a discrete set of "codes" from a codebook.
-# # # #     """
-# # # #     def __init__(self, num_embeddings, embedding_dim, commitment_cost):
-# # # #         super(VectorQuantizer, self).__init__()
-# # # #         self.num_embeddings = num_embeddings # Codebook size (e.g., 256)
-# # # #         self.embedding_dim = embedding_dim # Dimension of each code
-# # # #         self.commitment_cost = commitment_cost # 'beta' in VQ-VAE
-        
-# # # #         # The codebook
-# # # #         self.embedding = nn.Embedding(self.num_embeddings, self.embedding_dim)
-# # # #         self.embedding.weight.data.uniform_(-1.0 / self.num_embeddings, 1.0 / self.num_embeddings)
-
-# # # #     def forward(self, z_e):
-# # # #         # z_e shape: (B, C, T) -> (B*T, C)
-# # # #         z_e_flat = z_e.permute(0, 2, 1).contiguous().view(-1, self.embedding_dim)
-        
-# # # #         # Find the closest codebook vector (L2 distance)
-# # # #         distances = (torch.sum(z_e_flat**2, dim=1, keepdim=True) 
-# # # #                      + torch.sum(self.embedding.weight**2, dim=1)
-# # # #                      - 2 * torch.matmul(z_e_flat, self.embedding.weight.t()))
-        
-# # # #         # Get the indices of the closest vectors
-# # # #         encoding_indices = torch.argmin(distances, dim=1)
-        
-# # # #         # Quantize: Map indices back to codebook vectors
-# # # #         z_q = self.embedding(encoding_indices).view(z_e.shape[0], -1, self.embedding_dim)
-# # # #         z_q = z_q.permute(0, 2, 1).contiguous() # (B, C, T)
-
-# # # #         # VQ-VAE Loss (Commitment Loss)
-# # # #         e_loss = F.mse_loss(z_q.detach(), z_e) * self.commitment_cost
-# # # #         q_loss = F.mse_loss(z_q, z_e.detach())
-# # # #         vq_loss = q_loss + e_loss
-        
-# # # #         # Straight-Through Estimator (STE)
-# # # #         # This copies the gradient from z_q to z_e
-# # # #         z_q = z_e + (z_q - z_e).detach()
-        
-# # # #         return z_q, vq_loss, encoding_indices.view(z_e.shape[0], -1) # (B, T)
-
-# # # # # --- The New Codec Architecture Components ---
-# # # # # These are based on the SoundStream model, but simplified.
-
-# # # # HOP_SIZE = 320 # 20ms frame (320 samples / 16000 Hz = 0.02s)
-# # # # LATENT_DIM = 64
-# # # # VQ_EMBEDDINGS = 256 # 8 bits per code
-# # # # # 16000 bits/sec / 50 frames/sec = 320 bits/frame
-# # # # # 320 bits / 8 bits/index = 40 indices per frame
-# # # # NUM_QUANTIZERS = 40 # This is our 16kbps target (40 bytes * 50 fps = 2000 B/s = 16 kbps)
-
-# # # # class Encoder(nn.Module):
-# # # #     """
-# # # #     Causal encoder. Takes raw audio and produces latent vectors.
-# # # #     Takes a 320-sample chunk and produces 40 latent vectors.
-# # # #     Total stride must be 320 / 40 = 8.
-# # # #     """
-# # # #     def __init__(self):
-# # # #         super().__init__()
-# # # #         self.net = nn.Sequential(
-# # # #             CausalConv1d(1, 32, 7), nn.ELU(),
-# # # #             CausalConv1d(32, 64, 5, stride=2), nn.ELU(), # 320 -> 160
-# # # #             CausalConv1d(64, 64, 5, stride=2), nn.ELU(), # 160 -> 80
-# # # #             CausalConv1d(64, LATENT_DIM, 5, stride=2), nn.ELU() # 80 -> 40
-# # # #         )
-# # # #         # Output shape: (B, LATENT_DIM, 40)
-# # # #         # This is exactly what we need.
-
-# # # #     def forward(self, x):
-# # # #         return self.net(x)
-
-# # # # class Decoder(nn.Module):
-# # # #     """
-# # # #     Causal decoder. Takes quantized latents and reconstructs audio.
-# # # #     Must be the inverse of the Encoder.
-# # # #     """
-# # # #     def __init__(self):
-# # # #         super().__init__()
-# # # #         self.net = nn.Sequential(
-# # # #             CausalConvTranspose1d(LATENT_DIM, 64, 5, stride=2), nn.ELU(), # 40 -> 80
-# # # #             CausalConvTranspose1d(64, 64, 5, stride=2), nn.ELU(), # 80 -> 160
-# # # #             CausalConvTranspose1d(64, 32, 5, stride=2), nn.ELU(), # 160 -> 320
-# # # #             CausalConv1d(32, 1, 7), nn.Tanh() # Final output
-# # # #         )
-    
-# # # #     def forward(self, x):
-# # # #         return self.net(x)
-
-# # # # # --- Causal Transformer (for the Transformer-based Codec) ---
-# # # # class CausalTransformerEncoder(nn.Module):
-# # # #     def __init__(self, d_model, nhead, num_layers):
-# # # #         super().__init__()
-# # # #         self.d_model = d_model
-# # # #         layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
-# # # #         self.transformer = nn.TransformerEncoder(layer, num_layers=num_layers)
-    
-# # # #     def get_causal_mask(self, sz):
-# # # #         # Returns a mask of shape (sz, sz)
-# # # #         return torch.triu(torch.ones(sz, sz) * float('-inf'), diagonal=1)
-
-# # # #     def forward(self, x, state):
-# # # #         # x shape: (B, T, C) e.g. (1, 40, 64)
-# # # #         # state shape: (B, S, C) e.g. (1, 100, 64)
-        
-# # # #         if state is None:
-# # # #             # First frame, no state
-# # # #             inp = x
-# # # #         else:
-# # # #             # Append new frame to old state
-# # # #             inp = torch.cat([state, x], dim=1)
-        
-# # # #         # We must limit the state size to avoid OOM
-# # # #         # Let's say, 10 frames of history (10 * 40 = 400 steps)
-# # # #         STATE_LEN = 400
-# # # #         if inp.shape[1] > STATE_LEN:
-# # # #             inp = inp[:, -STATE_LEN:, :]
-        
-# # # #         new_state = inp.detach() # The new state is the full input
-        
-# # # #         # Create a causal mask for the *full input sequence*
-# # # #         mask = self.get_causal_mask(inp.shape[1]).to(x.device)
-        
-# # # #         # Process the full sequence
-# # # #         out = self.transformer(inp, mask=mask)
-        
-# # # #         # Only return the *new* frames, corresponding to x
-# # # #         # This is how we make it stateful
-# # # #         out = out[:, -x.shape[1]:, :] # (B, T, C)
-        
-# # # #         return out, new_state
-
-
-# # # # # --- MODEL 1: GRU Codec (Fast) ---
-# # # # class GRU_Codec(nn.Module):
-# # # #     """
-# # # #     A stateful, causal codec using a GRU (RNN) as the core.
-# # # #     This is the "simpler neural approach" and is very fast.
-# # # #     """
-# # # #     def __init__(self):
-# # # #         super().__init__()
-# # # #         self.encoder = Encoder()
-# # # #         self.quantizer = VectorQuantizer(VQ_EMBEDDINGS, LATENT_DIM, 0.25)
-# # # #         self.decoder = Decoder()
-        
-# # # #         self.encoder_rnn = nn.GRU(LATENT_DIM, LATENT_DIM, batch_first=True)
-# # # #         self.decoder_rnn = nn.GRU(LATENT_DIM, LATENT_DIM, batch_first=True)
-    
-# # # #     def forward(self, x, h_enc=None, h_dec=None):
-# # # #         # x: (B, 1, T)
-# # # #         z_e = self.encoder(x) # (B, C, T_latent)
-        
-# # # #         # --- Stateful RNN ---
-# # # #         # (B, C, T_latent) -> (B, T_latent, C)
-# # # #         z_e_rnn_in = z_e.permute(0, 2, 1)
-# # # #         z_e_rnn_out, h_enc_new = self.encoder_rnn(z_e_rnn_in, h_enc)
-# # # #         # (B, T_latent, C) -> (B, C, T_latent)
-# # # #         z_e_rnn_out = z_e_rnn_out.permute(0, 2, 1)
-# # # #         # ---
-        
-# # # #         z_q, vq_loss, indices = self.quantizer(z_e_rnn_out)
-
-# # # #         # --- Stateful RNN ---
-# # # #         # (B, C, T_latent) -> (B, T_latent, C)
-# # # #         z_q_rnn_in = z_q.permute(0, 2, 1)
-# # # #         z_q_rnn_out, h_dec_new = self.decoder_rnn(z_q_rnn_in, h_dec)
-# # # #         # (B, T_latent, C) -> (B, C, T_latent)
-# # # #         z_q_rnn_out = z_q_rnn_out.permute(0, 2, 1)
-# # # #         # ---
-        
-# # # #         x_hat = self.decoder(z_q_rnn_out)
-        
-# # # #         return x_hat, vq_loss, (h_enc_new, h_dec_new)
-
-# # # #     def encode(self, x, h_enc):
-# # # #         """For streaming: encode audio to indices."""
-# # # #         z_e = self.encoder(x) # (B, C, 40)
-# # # #         z_e_rnn_in = z_e.permute(0, 2, 1)
-# # # #         z_e_rnn_out, h_enc_new = self.encoder_rnn(z_e_rnn_in, h_enc)
-# # # #         z_e_rnn_out = z_e_rnn_out.permute(0, 2, 1)
-        
-# # # #         # We don't need vq_loss here, just indices
-# # # #         _, _, indices = self.quantizer(z_e_rnn_out) # (B, 40)
-# # # #         return indices, h_enc_new
-
-# # # #     def decode(self, indices, h_dec):
-# # # #         """For streaming: decode indices to audio."""
-# # # #         # Convert indices (B, 40) to codebook vectors (B, C, 40)
-# # # #         z_q = self.quantizer.embedding(indices) # (B, 40, C)
-# # # #         z_q = z_q.permute(0, 2, 1) # (B, C, 40)
-        
-# # # #         z_q_rnn_in = z_q.permute(0, 2, 1)
-# # # #         z_q_rnn_out, h_dec_new = self.decoder_rnn(z_q_rnn_in, h_dec)
-# # # #         z_q_rnn_out = z_q_rnn_out.permute(0, 2, 1)
-        
-# # # #         x_hat = self.decoder(z_q_rnn_out) # (B, 1, 320)
-# # # #         return x_hat, h_dec_new
-
-
-# # # # # --- MODEL 2: TS3 Codec (Transformer) ---
-# # # # class TS3_Codec(nn.Module):
-# # # #     """
-# # # #     A stateful, causal codec using a Causal Transformer as the core.
-# # # #     This directly addresses your "Transformer" requirement.
-# # # #     """
-# # # #     def __init__(self):
-# # # #         super().__init__()
-# # # #         self.encoder = Encoder()
-# # # #         self.quantizer = VectorQuantizer(VQ_EMBEDDINGS, LATENT_DIM, 0.25)
-# # # #         self.decoder = Decoder()
-        
-# # # #         self.encoder_tfm = CausalTransformerEncoder(LATENT_DIM, nhead=4, num_layers=2)
-# # # #         self.decoder_tfm = CausalTransformerEncoder(LATENT_DIM, nhead=4, num_layers=2)
-    
-# # # #     def forward(self, x, h_enc=None, h_dec=None):
-# # # #         # x: (B, 1, T)
-# # # #         z_e = self.encoder(x) # (B, C, T_latent)
-        
-# # # #         # --- Stateful TFM ---
-# # # #         z_e_tfm_in = z_e.permute(0, 2, 1) # (B, T_latent, C)
-# # # #         z_e_tfm_out, h_enc_new = self.encoder_tfm(z_e_tfm_in, h_enc)
-# # # #         z_e_tfm_out = z_e_tfm_out.permute(0, 2, 1) # (B, C, T_latent)
-# # # #         # ---
-        
-# # # #         z_q, vq_loss, indices = self.quantizer(z_e_tfm_out)
-
-# # # #         # --- Stateful TFM ---
-# # # #         z_q_tfm_in = z_q.permute(0, 2, 1) # (B, T_latent, C)
-# # # #         z_q_tfm_out, h_dec_new = self.decoder_tfm(z_q_tfm_in, h_dec)
-# # # #         z_q_tfm_out = z_q_tfm_out.permute(0, 2, 1) # (B, C, T_latent)
-# # # #         # ---
-        
-# # # #         x_hat = self.decoder(z_q_tfm_out)
-        
-# # # #         return x_hat, vq_loss, (h_enc_new, h_dec_new)
-
-# # # #     def encode(self, x, h_enc):
-# # # #         """For streaming: encode audio to indices."""
-# # # #         z_e = self.encoder(x) # (B, C, 40)
-# # # #         z_e_tfm_in = z_e.permute(0, 2, 1)
-# # # #         z_e_tfm_out, h_enc_new = self.encoder_tfm(z_e_tfm_in, h_enc)
-# # # #         z_e_tfm_out = z_e_tfm_out.permute(0, 2, 1)
-        
-# # # #         _, _, indices = self.quantizer(z_e_tfm_out) # (B, 40)
-# # # #         return indices, h_enc_new
-
-# # # #     def decode(self, indices, h_dec):
-# # # #         """For streaming: decode indices to audio."""
-# # # #         z_q = self.quantizer.embedding(indices) # (B, 40, C)
-        
-# # # #         # TFM model input is (B, 40, C)
-# # # #         z_q_tfm_out, h_dec_new = self.decoder_tfm(z_q, h_dec)
-# # # #         z_q_tfm_out = z_q_tfm_out.permute(0, 2, 1) # (B, C, 40)
-        
-# # # #         x_hat = self.decoder(z_q_tfm_out) # (B, 1, 320)
-# # # #         return x_hat, h_dec_new
-
-# # # # # --- MODEL 3: ScoreDec (Diffusion Post-Filter) ---
-
-# # # # class SinusoidalPosEmb(nn.Module):
-# # # #     def __init__(self, dim):
-# # # #         super().__init__()
-# # # #         self.dim = dim
-
-# # # #     def forward(self, x):
-# # # #         half_dim = self.dim // 2
-# # # #         emb = math.log(10000) / (half_dim - 1)
-# # # #         emb = torch.exp(torch.arange(half_dim, device=x.device) * -emb)
-# # # #         emb = x[:, None] * emb[None, :]
-# # # #         return torch.cat((emb.sin(), emb.cos()), dim=-1)
-
-# # # # class DiffusionBlock(nn.Module):
-# # # #     """A single U-Net block for the diffusion model."""
-# # # #     def __init__(self, in_channels, out_channels, time_emb_dim, cond_dim):
-# # # #         super().__init__()
-# # # #         self.time_mlp = nn.Linear(time_emb_dim, out_channels)
-# # # #         self.cond_mlp = nn.Linear(cond_dim, out_channels)
-        
-# # # #         self.conv1 = CausalConv1d(in_channels, out_channels, kernel_size=3, padding=1)
-# # # #         self.conv2 = CausalConv1d(out_channels, out_channels, kernel_size=3, padding=1)
-# # # #         self.bn1 = nn.BatchNorm1d(out_channels)
-# # # #         self.bn2 = nn.BatchNorm1d(out_channels)
-# # # #         self.relu = nn.ReLU()
-
-# # # #     def forward(self, x, t_emb, cond_emb):
-# # # #         h = self.relu(self.bn1(self.conv1(x)))
-        
-# # # #         # Add time and condition embeddings
-# # # #         time_emb = self.relu(self.time_mlp(t_emb))
-# # # #         cond_emb = self.relu(self.cond_mlp(cond_emb))
-# # # #         h = h + time_emb.unsqueeze(-1) + cond_emb.unsqueeze(-1)
-        
-# # # #         h = self.relu(self.bn2(self.conv2(h)))
-# # # #         return h
-
-# # # # class DiffusionUNet1D(nn.Module):
-# # # #     """A 1D U-Net for diffusion, conditioned on the low-quality codec output."""
-# # # #     def __init__(self, in_channels=1, model_channels=64, time_emb_dim=256, cond_dim=1):
-# # # #         super().__init__()
-# # # #         self.time_mlp = nn.Sequential(SinusoidalPosEmb(time_emb_dim), nn.Linear(time_emb_dim, time_emb_dim), nn.ReLU())
-        
-# # # #         # Conditioning projector
-# # # #         self.cond_proj = nn.Conv1d(cond_dim, 64, 1)
-        
-# # # #         self.down1 = DiffusionBlock(in_channels, model_channels, time_emb_dim, 64)
-# # # #         self.down2 = DiffusionBlock(model_channels, model_channels * 2, time_emb_dim, 64)
-# # # #         self.bot = DiffusionBlock(model_channels * 2, model_channels * 2, time_emb_dim, 64)
-# # # #         self.up1 = DiffusionBlock(model_channels * 3, model_channels, time_emb_dim, 64)
-# # # #         self.out = CausalConv1d(model_channels, in_channels, kernel_size=1)
-        
-# # # #         self.pool = nn.MaxPool1d(2)
-# # # #         self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
-        
-# # # #         # --- Simpler ScoreDec Model ---
-# # # #         # This part was incorrectly indented inside a 'forward' method.
-# # # #         # It is now correctly placed inside '__init__'.
-        
-# # # #         self.time_mlp_simple = nn.Sequential(SinusoidalPosEmb(time_emb_dim), nn.Linear(time_emb_dim, model_channels), nn.ReLU())
-# # # #         self.cond_proj_simple = CausalConv1d(cond_dim, model_channels, 1)
-# # # #         self.in_conv = CausalConv1d(in_channels, model_channels, 1)
-        
-# # # #         self.blocks = nn.ModuleList([
-# # # #             CausalConv1d(model_channels, model_channels, 3, padding=1) for _ in range(4)
-# # # #         ])
-# # # #         self.out_conv = CausalConv1d(model_channels, in_channels, 1)
-
-# # # #     # This buggy U-Net forward pass is unused and has been removed.
-# # # #     # The comments inside it were moved to '__init__'.
-
-# # # #     def forward_simple(self, x, time, cond):
-# # # #         t_emb = self.time_mlp_simple(time).unsqueeze(-1) # (B, C, 1)
-# # # #         c_emb = self.cond_proj_simple(cond) # (B, C, T)
-# # # #         x = self.in_conv(x) # (B, C, T)
-        
-# # # #         h = x + t_emb + c_emb
-# # # #         for block in self.blocks:
-# # # #             h = block(h) + h # Residual
-# # # #         return self.out_conv(h)
-
-# # # #     # Let's stick to the simple forward
-# # # #     def forward(self, x, time, cond):
-# # # #         return self.forward_simple(x, time, cond)
-
-# # # # class ScoreDecPostFilter(nn.Module):
-# # # #     """
-# # # #     Wraps the diffusion U-Net and provides the enhancement logic.
-# # # #     This is what is called by the streaming/evaluation tabs.
-# # # #     """
-# # # #     def __init__(self, timesteps=50, model_channels=64):
-# # # #         super().__init__()
-# # # #         self.timesteps = timesteps
-# # # #         self.model = DiffusionUNet1D(model_channels=model_channels)
-        
-# # # #         betas = torch.linspace(1e-4, 0.02, timesteps)
-# # # #         alphas = 1. - betas
-# # # #         alphas_cumprod = torch.cumprod(alphas, axis=0)
-
-# # # #         self.register_buffer('betas', betas)
-# # # #         self.register_buffer('alphas_cumprod', alphas_cumprod)
-# # # #         self.register_buffer('alphas', alphas)
-        
-# # # #     def q_sample(self, x_start, t, noise=None):
-# # # #         """Forward diffusion: noise the clean signal."""
-# # # #         if noise is None: noise = torch.randn_like(x_start)
-# # # #         sqrt_alphas_cumprod_t = self.alphas_cumprod[t].sqrt().view(x_start.shape[0], 1, 1)
-# # # #         sqrt_one_minus_alphas_cumprod_t = (1. - self.alphas_cumprod[t]).sqrt().view(x_start.shape[0], 1, 1)
-# # # #         return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
-
-# # # #     @torch.no_grad()
-# # # #     def p_sample(self, x_t, t, cond):
-# # # #         """One step of the reverse diffusion process."""
-# # # #         t_tensor = torch.full((x_t.shape[0],), t, device=x_t.device, dtype=torch.long)
-# # # #         alpha_t = self.alphas[t].view(-1, 1, 1)
-# # # #         alpha_cumprod_t = self.alphas_cumprod[t].view(-1, 1, 1)
-        
-# # # #         predicted_noise = self.model(x_t, t_tensor.float(), cond)
-        
-# # # #         # DDPM sampling step
-# # # #         x_prev = (x_t - ((1-alpha_t) / (1-alpha_cumprod_t).sqrt()) * predicted_noise) / alpha_t.sqrt()
-        
-# # # #         if t > 0:
-# # # #             noise = torch.randn_like(x_t)
-# # # #             alpha_cumprod_prev_t = self.alphas_cumprod[t-1]
-# # # #             posterior_variance = (1-alpha_cumprod_prev_t) / (1-alpha_cumprod_t) * self.betas[t]
-# # # #             x_prev += torch.sqrt(posterior_variance.view(-1, 1, 1)) * noise
-# # # #         return x_prev
-
-# # # #     @torch.no_grad()
-# # # #     def enhance(self, x_low_quality, timesteps=10):
-# # # #         """
-# # # #         The main enhancement function.
-# # # #         x_low_quality is the output from the GRU_Codec.
-# # # #         This is SLOW and NOT real-time.
-# # # #         """
-# # # #         # Start from the low-quality audio, but add noise
-# # # #         t_start = timesteps - 1
-# # # #         x_t = self.q_sample(x_low_quality, torch.tensor([t_start], device=x_low_quality.device))
-        
-# # # #         for i in reversed(range(timesteps)):
-# # # #             x_t = self.p_sample(x_t, i, cond=x_low_quality)
-            
-# # # #         return torch.tanh(x_t)
-
-
-# # # # # --- TRADITIONAL CODECS (For Baseline Comparison) ---
-# # # # class MuLawCodec:
-# # # #     def __init__(self, quantization_channels=256): self.mu = float(quantization_channels - 1)
-# # # #     def encode(self, x):
-# # # #         mu_t = torch.tensor(self.mu, device=x.device, dtype=torch.float32)
-# # # #         encoded = torch.sign(x) * torch.log1p(mu_t * torch.abs(x)) / torch.log1p(mu_t)
-# # # #         return (((encoded + 1) / 2 * self.mu) + 0.5).to(torch.uint8)
-# # # #     def decode(self, z):
-# # # #         z_float = z.to(torch.float32)
-# # # #         mu_t = torch.tensor(self.mu, device=z.device, dtype=torch.float32)
-# # # #         y = (z_float / self.mu) * 2.0 - 1.0
-# # # #         return (torch.sign(y) * (1.0 / self.mu) * (torch.pow(1.0 + self.mu, torch.abs(y)) - 1.0)).unsqueeze(1)
-
-# # # # class ALawCodec:
-# # # #     def __init__(self): self.A = 87.6
-# # # #     def encode(self, x):
-# # # #         a_t = torch.tensor(self.A, device=x.device, dtype=torch.float32)
-# # # #         abs_x = torch.abs(x)
-# # # #         encoded = torch.zeros_like(x)
-# # # #         cond = abs_x < (1 / self.A)
-# # # #         encoded[cond] = torch.sign(x[cond]) * (a_t * abs_x[cond]) / (1 + torch.log(a_t))
-# # # #         encoded[~cond] = torch.sign(x[~cond]) * (1 + torch.log(a_t * abs_x[~cond])) / (1 + torch.log(a_t))
-# # # #         return (((encoded + 1) / 2 * 255) + 0.5).to(torch.uint8)
-# # # #     def decode(self, z):
-# # # #         z_float = z.to(torch.float32)
-# # # #         a_t = torch.tensor(self.A, device=z.device, dtype=torch.float32)
-# # # #         y = (z_float / 127.5) - 1.0
-# # # #         abs_y = torch.abs(y)
-# # # #         decoded = torch.zeros_like(y)
-# # # #         cond = abs_y < (1 / (1 + torch.log(a_t)))
-# # # #         decoded[cond] = torch.sign(y[cond]) * (abs_y[cond] * (1 + torch.log(a_t))) / a_t
-# # # #         decoded[~cond] = torch.sign(y[~cond]) * torch.exp(abs_y[~cond] * (1 + torch.log(a_t)) - 1) / a_t
-# # # #         return decoded.unsqueeze(1)
-
-# # # # # --- DATASET & TRAINING ---
-# # # # TRAIN_CHUNK_SIZE = 16000 # 1 second
-
-# # # # class AudioChunkDataset(Dataset):
-# # # #     def __init__(self, directory, chunk_size=TRAIN_CHUNK_SIZE, sample_rate=16000):
-# # # #         self.chunk_size, self.sample_rate = chunk_size, sample_rate
-# # # #         self.file_paths = [os.path.join(r, f) for r, _, fs in os.walk(directory) for f in fs if f.lower().endswith(('.wav', '.flac'))]
-# # # #         if not self.file_paths: raise ValueError("No audio files found.")
-# # # #     def __len__(self): return len(self.file_paths)
-# # # #     def __getitem__(self, idx):
-# # # #         try:
-# # # #             waveform, sr = torchaudio.load(self.file_paths[idx])
-# # # #             if sr != self.sample_rate: waveform = torchaudio.transforms.Resample(sr, self.sample_rate)(waveform)
-# # # #             if waveform.shape[0] > 1: waveform = torch.mean(waveform, dim=0, keepdim=True)
-# # # #             if waveform.shape[1] > self.chunk_size:
-# # # #                 start = np.random.randint(0, waveform.shape[1] - self.chunk_size)
-# # # #                 waveform = waveform[:, start:start + self.chunk_size]
-# # # #             else:
-# # # #                 waveform = F.pad(waveform, (0, self.chunk_size - waveform.shape[1]))
-# # # #             return waveform
-# # # #         except Exception as e:
-# # # #             print(f"Warning: Skipping file {self.file_paths[idx]}. Error: {e}")
-# # # #             return torch.zeros((1, self.chunk_size))
-
-# # # # def train_model(dataset_path, epochs, learning_rate, batch_size, model_save_path, progress_callback, stop_event, model_type):
-# # # #     """
-# # # #     Main training function. Now handles 'gru', 'transformer', and 'scoredec' types.
-# # # #     """
-# # # #     try:
-# # # #         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# # # #         progress_callback.emit(f"Using device: {device}")
-        
-# # # #         dataset = AudioChunkDataset(directory=dataset_path)
-# # # #         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
-# # # #         progress_callback.emit(f"Dataset loaded with {len(dataset)} files.")
-
-# # # #         if model_type == 'gru':
-# # # #             model = GRU_Codec().to(device)
-# # # #             optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-# # # #             stft_criterion = MultiResolutionSTFTLoss().to(device)
-# # # #             l1_criterion = nn.L1Loss().to(device)
-# # # #             progress_callback.emit(f"Starting training for GRU_Codec model...")
-        
-# # # #         elif model_type == 'transformer':
-# # # #             model = TS3_Codec().to(device)
-# # # #             optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-# # # #             stft_criterion = MultiResolutionSTFTLoss().to(device)
-# # # #             l1_criterion = nn.L1Loss().to(device)
-# # # #             progress_callback.emit(f"Starting training for TS3_Codec model...")
-        
-# # # #         elif model_type == 'scoredec':
-# # # #             progress_callback.emit("--- Starting ScoreDec Post-Filter Training ---")
-# # # #             progress_callback.emit("Loading pre-trained GRU_Codec...")
-# # # #             try:
-# # # #                 gru_codec = GRU_Codec().to(device)
-# # # #                 gru_codec.load_state_dict(torch.load("low_latency_codec_gru.pth", map_location=device))
-# # # #                 gru_codec.eval()
-# # # #                 for param in gru_codec.parameters():
-# # # #                     param.requires_grad = False
-# # # #                 progress_callback.emit("GRU_Codec loaded and frozen.")
-# # # #             except FileNotFoundError:
-# # # #                 progress_callback.emit("ERROR: 'low_latency_codec_gru.pth' not found. You must train the GRU_Codec first.")
-# # # #                 return
-            
-# # # #             model = ScoreDecPostFilter().to(device)
-# # # #             optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-# # # #             l1_criterion = nn.L1Loss().to(device)
-# # # #             progress_callback.emit("Starting training for ScoreDec model...")
-            
-# # # #         else:
-# # # #             raise ValueError(f"Unknown model type for training: {model_type}")
-
-# # # #         # --- Main Training Loop ---
-# # # #         for epoch in range(epochs):
-# # # #             if stop_event.is_set():
-# # # #                 progress_callback.emit("Training stopped by user."); break
-            
-# # # #             for i, data in enumerate(dataloader):
-# # # #                 inputs = data.to(device)
-# # # #                 optimizer.zero_grad()
-                
-# # # #                 if model_type in ['gru', 'transformer']:
-# # # #                     h_enc, h_dec = None, None # Reset state per batch
-# # # #                     x_hat, vq_loss, (h_enc, h_dec) = model(inputs, h_enc, h_dec)
-# # # #                     x_hat = x_hat[..., :inputs.shape[-1]]
-                    
-# # # #                     stft_loss = stft_criterion(x_hat, inputs)
-# # # #                     l1_loss = l1_criterion(x_hat, inputs)
-# # # #                     loss = stft_loss + 0.1 * l1_loss + vq_loss
-                    
-# # # #                     if i % 20 == 19:
-# # # #                         progress_callback.emit(f"[Epoch {epoch + 1}, Batch {i + 1}] Loss: {loss.item():.5f} (STFT: {stft_loss.item():.4f}, VQ: {vq_loss.item():.4f})")
-
-# # # #                 elif model_type == 'scoredec':
-# # # #                     with torch.no_grad():
-# # # #                         x_hat_low_quality, _, _ = gru_codec(inputs)
-# # # #                         x_hat_low_quality = x_hat_low_quality.detach()
-                    
-# # # #                     # Train diffusion model
-# # # #                     t = torch.randint(0, model.timesteps, (inputs.shape[0],), device=device).long()
-# # # #                     x_t, noise = model.q_sample(x_start=inputs, t=t)
-                    
-# # # #                     predicted_noise = model.model(x_t, t.float(), cond=x_hat_low_quality)
-# # # #                     loss = l1_criterion(predicted_noise, noise)
-                    
-# # # #                     if i % 20 == 19:
-# # # #                         progress_callback.emit(f"[Epoch {epoch + 1}, Batch {i + 1}] Denoising Loss: {loss.item():.5f}")
-
-# # # #                 loss.backward()
-# # # #                 optimizer.step()
-
-# # # #             progress_callback.emit(f"--- Epoch {epoch + 1} finished ---")
-
-# # # #         if not stop_event.is_set():
-# # # #             progress_callback.emit("Training finished. Saving model...")
-# # # #             torch.save(model.state_dict(), model_save_path)
-# # # #             progress_callback.emit(f"Model saved to {model_save_path}")
-# # # #     except Exception as e:
-# # # #         progress_callback.emit(f"ERROR in training: {e}")
-
-# # # import torch
-# # # import torch.nn as nn
-# # # import torch.optim as optim
-# # # from torch.utils.data import Dataset, DataLoader
-# # # import torchaudio
-# # # import os
-# # # import numpy as np
-# # # import torch.nn.functional as F
-# # # import math
-
-# # # # --- Perceptual Loss Function ---
-# # # class MultiResolutionSTFTLoss(nn.Module):
-# # #     """
-# # #     Multi-resolution STFT loss, common in audio generation models.
-# # #     This is a key part of achieving high quality (PESQ/STOI).
-# # #     """
-# # #     def __init__(self, fft_sizes=[1024, 2048, 512], hop_sizes=[120, 240, 50], win_lengths=[600, 1200, 240]):
-# # #         super(MultiResolutionSTFTLoss, self).__init__()
-# # #         self.fft_sizes = fft_sizes
-# # #         self.hop_sizes = hop_sizes
-# # #         self.win_lengths = win_lengths
-# # #         self.window = torch.hann_window
-# # #         assert len(fft_sizes) == len(hop_sizes) == len(win_lengths)
-
-# # #     def forward(self, y_hat, y):
-# # #         sc_loss, mag_loss = 0.0, 0.0
-# # #         for fft, hop, win in zip(self.fft_sizes, self.hop_sizes, self.win_lengths):
-# # #             window = self.window(win, device=y.device)
-# # #             spec_hat = torch.stft(y_hat.squeeze(1), n_fft=fft, hop_length=hop, win_length=win, window=window, return_complex=True)
-# # #             spec = torch.stft(y.squeeze(1), n_fft=fft, hop_length=hop, win_length=win, window=window, return_complex=True)
-            
-# # #             sc_loss += torch.norm(torch.abs(spec) - torch.abs(spec_hat), p='fro') / torch.norm(torch.abs(spec), p='fro')
-# # #             mag_loss += F.l1_loss(torch.log(torch.abs(spec).clamp(min=1e-9)), torch.log(torch.abs(spec_hat).clamp(min=1e-9)))
-            
-# # #         return (sc_loss / len(self.fft_sizes)) + (mag_loss / len(self.fft_sizes))
-
-# # # # --- Causal Convolution ---
-# # # class CausalConv1d(nn.Conv1d):
-# # #     """
-# # #     A 1D convolution that is causal (cannot see the future).
-# # #     This is critical for the < 20ms latency goal.
-# # #     """
-# # #     def __init__(self, *args, **kwargs):
-# # #         super().__init__(*args, **kwargs)
-# # #         # Calculate the padding needed to make it causal
-# # #         self.causal_padding = self.kernel_size[0] - 1
-
-# # #     def forward(self, x):
-# # #         # Pad on the left (past) only
-# # #         return super().forward(F.pad(x, (self.causal_padding, 0)))
-
-# # # class CausalConvTranspose1d(nn.ConvTranspose1d):
-# # #     """
-# # #     A 1D *transpose* convolution that is causal.
-# # #     It removes output samples that would "see the future".
-# # #     """
-# # #     def __init__(self, *args, **kwargs):
-# # #         super().__init__(*args, **kwargs)
-# # #         self.causal_padding = self.kernel_size[0] - self.stride[0]
-
-# # #     def forward(self, x):
-# # #         x = super().forward(x)
-# # #         # Remove the invalid, "future-seeing" samples from the end
-# # #         if self.causal_padding != 0:
-# # #             return x[..., :-self.causal_padding]
-# # #         return x
-
-# # # # --- Vector Quantizer (The heart of the *COMPRESSION*) ---
-# # # class VectorQuantizer(nn.Module):
-# # #     """
-# # #     The Vector Quantizer (VQ) module. This is what enables low-bitrate compression.
-# # #     It maps continuous latent vectors to a discrete set of "codes" from a codebook.
-# # #     """
-# # #     def __init__(self, num_embeddings, embedding_dim, commitment_cost):
-# # #         super(VectorQuantizer, self).__init__()
-# # #         self.num_embeddings = num_embeddings # Codebook size (e.g., 256)
-# # #         self.embedding_dim = embedding_dim # Dimension of each code
-# # #         self.commitment_cost = commitment_cost # 'beta' in VQ-VAE
-        
-# # #         # The codebook
-# # #         self.embedding = nn.Embedding(self.num_embeddings, self.embedding_dim)
-# # #         self.embedding.weight.data.uniform_(-1.0 / self.num_embeddings, 1.0 / self.num_embeddings)
-
-# # #     def forward(self, z_e):
-# # #         # z_e shape: (B, C, T) -> (B*T, C)
-# # #         z_e_flat = z_e.permute(0, 2, 1).contiguous().view(-1, self.embedding_dim)
-        
-# # #         # Find the closest codebook vector (L2 distance)
-# # #         distances = (torch.sum(z_e_flat**2, dim=1, keepdim=True) 
-# # #                      + torch.sum(self.embedding.weight**2, dim=1)
-# # #                      - 2 * torch.matmul(z_e_flat, self.embedding.weight.t()))
-        
-# # #         # Get the indices of the closest vectors
-# # #         encoding_indices = torch.argmin(distances, dim=1)
-        
-# # #         # Quantize: Map indices back to codebook vectors
-# # #         z_q = self.embedding(encoding_indices).view(z_e.shape[0], -1, self.embedding_dim)
-# # #         z_q = z_q.permute(0, 2, 1).contiguous() # (B, C, T)
-
-# # #         # VQ-VAE Loss (Commitment Loss)
-# # #         e_loss = F.mse_loss(z_q.detach(), z_e) * self.commitment_cost
-# # #         q_loss = F.mse_loss(z_q, z_e.detach())
-# # #         vq_loss = q_loss + e_loss
-        
-# # #         # Straight-Through Estimator (STE)
-# # #         # This copies the gradient from z_q to z_e
-# # #         z_q = z_e + (z_q - z_e).detach()
-        
-# # #         return z_q, vq_loss, encoding_indices.view(z_e.shape[0], -1) # (B, T)
-
-# # # # --- The New Codec Architecture Components ---
-# # # # These are based on the SoundStream model, but simplified.
-
-# # # HOP_SIZE = 320 # 20ms frame (320 samples / 16000 Hz = 0.02s)
-# # # LATENT_DIM = 64
-# # # VQ_EMBEDDINGS = 256 # 8 bits per code
-# # # # 16000 bits/sec / 50 frames/sec = 320 bits/frame
-# # # # 320 bits / 8 bits/index = 40 indices per frame
-# # # NUM_QUANTIZERS = 40 # This is our 16kbps target (40 bytes * 50 fps = 2000 B/s = 16 kbps)
-
-# # # class Encoder(nn.Module):
-# # #     """
-# # #     Causal encoder. Takes raw audio and produces latent vectors.
-# # #     Takes a 320-sample chunk and produces 40 latent vectors.
-# # #     Total stride must be 320 / 40 = 8.
-# # #     """
-# # #     def __init__(self):
-# # #         super().__init__()
-# # #         self.net = nn.Sequential(
-# # #             CausalConv1d(1, 32, 7), nn.ELU(),
-# # #             CausalConv1d(32, 64, 5, stride=2), nn.ELU(), # 320 -> 160
-# # #             CausalConv1d(64, 64, 5, stride=2), nn.ELU(), # 160 -> 80
-# # #             CausalConv1d(64, LATENT_DIM, 5, stride=2), nn.ELU() # 80 -> 40
-# # #         )
-# # #         # Output shape: (B, LATENT_DIM, 40)
-# # #         # This is exactly what we need.
-
-# # #     def forward(self, x):
-# # #         return self.net(x)
-
-# # # class Decoder(nn.Module):
-# # #     """
-# # #     Causal decoder. Takes quantized latents and reconstructs audio.
-# # #     Must be the inverse of the Encoder.
-# # #     """
-# # #     def __init__(self):
-# # #         super().__init__()
-# # #         self.net = nn.Sequential(
-# # #             CausalConvTranspose1d(LATENT_DIM, 64, 5, stride=2), nn.ELU(), # 40 -> 80
-# # #             CausalConvTranspose1d(64, 64, 5, stride=2), nn.ELU(), # 80 -> 160
-# # #             CausalConvTranspose1d(64, 32, 5, stride=2), nn.ELU(), # 160 -> 320
-# # #             CausalConv1d(32, 1, 7), nn.Tanh() # Final output
-# # #         )
-    
-# # #     def forward(self, x):
-# # #         return self.net(x)
-
-# # # # --- Causal Transformer (for the Transformer-based Codec) ---
-# # # class CausalTransformerEncoder(nn.Module):
-# # #     def __init__(self, d_model, nhead, num_layers):
-# # #         super().__init__()
-# # #         self.d_model = d_model
-# # #         layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
-# # #         self.transformer = nn.TransformerEncoder(layer, num_layers=num_layers)
-    
-# # #     def get_causal_mask(self, sz):
-# # #         # Returns a mask of shape (sz, sz)
-# # #         return torch.triu(torch.ones(sz, sz) * float('-inf'), diagonal=1)
-
-# # #     def forward(self, x, state):
-# # #         # x shape: (B, T, C) e.g. (1, 40, 64)
-# # #         # state shape: (B, S, C) e.g. (1, 100, 64)
-        
-# # #         if state is None:
-# # #             # First frame, no state
-# # #             inp = x
-# # #         else:
-# # #             # Append new frame to old state
-# # #             inp = torch.cat([state, x], dim=1)
-        
-# # #         # We must limit the state size to avoid OOM
-# # #         # Let's say, 10 frames of history (10 * 40 = 400 steps)
-# # #         STATE_LEN = 400
-# # #         if inp.shape[1] > STATE_LEN:
-# # #             inp = inp[:, -STATE_LEN:, :]
-        
-# # #         new_state = inp.detach() # The new state is the full input
-        
-# # #         # Create a causal mask for the *full input sequence*
-# # #         mask = self.get_causal_mask(inp.shape[1]).to(x.device)
-        
-# # #         # Process the full sequence
-# # #         out = self.transformer(inp, mask=mask)
-        
-# # #         # Only return the *new* frames, corresponding to x
-# # #         # This is how we make it stateful
-# # #         out = out[:, -x.shape[1]:, :] # (B, T, C)
-        
-# # #         return out, new_state
-
-
-# # # # --- MODEL 1: GRU Codec (Fast) ---
-# # # class GRU_Codec(nn.Module):
-# # #     """
-# # #     A stateful, causal codec using a GRU (RNN) as the core.
-# # #     This is the "simpler neural approach" and is very fast.
-# # #     """
-# # #     def __init__(self):
-# # #         super().__init__()
-# # #         self.encoder = Encoder()
-# # #         self.quantizer = VectorQuantizer(VQ_EMBEDDINGS, LATENT_DIM, 0.25)
-# # #         self.decoder = Decoder()
-        
-# # #         self.encoder_rnn = nn.GRU(LATENT_DIM, LATENT_DIM, batch_first=True)
-# # #         self.decoder_rnn = nn.GRU(LATENT_DIM, LATENT_DIM, batch_first=True)
-    
-# # #     def forward(self, x, h_enc=None, h_dec=None):
-# # #         # x: (B, 1, T)
-# # #         z_e = self.encoder(x) # (B, C, T_latent)
-        
-# # #         # --- Stateful RNN ---
-# # #         # (B, C, T_latent) -> (B, T_latent, C)
-# # #         z_e_rnn_in = z_e.permute(0, 2, 1)
-# # #         z_e_rnn_out, h_enc_new = self.encoder_rnn(z_e_rnn_in, h_enc)
-# # #         # (B, T_latent, C) -> (B, C, T_latent)
-# # #         z_e_rnn_out = z_e_rnn_out.permute(0, 2, 1)
-# # #         # ---
-        
-# # #         z_q, vq_loss, indices = self.quantizer(z_e_rnn_out)
-
-# # #         # --- Stateful RNN ---
-# # #         # (B, C, T_latent) -> (B, T_latent, C)
-# # #         z_q_rnn_in = z_q.permute(0, 2, 1)
-# # #         z_q_rnn_out, h_dec_new = self.decoder_rnn(z_q_rnn_in, h_dec)
-# # #         # (B, T_latent, C) -> (B, C, T_latent)
-# # #         z_q_rnn_out = z_q_rnn_out.permute(0, 2, 1)
-# # #         # ---
-        
-# # #         x_hat = self.decoder(z_q_rnn_out)
-        
-# # #         return x_hat, vq_loss, (h_enc_new, h_dec_new)
-
-# # #     def encode(self, x, h_enc):
-# # #         """For streaming: encode audio to indices."""
-# # #         z_e = self.encoder(x) # (B, C, 40)
-# # #         z_e_rnn_in = z_e.permute(0, 2, 1)
-# # #         z_e_rnn_out, h_enc_new = self.encoder_rnn(z_e_rnn_in, h_enc)
-# # #         z_e_rnn_out = z_e_rnn_out.permute(0, 2, 1)
-        
-# # #         # We don't need vq_loss here, just indices
-# # #         _, _, indices = self.quantizer(z_e_rnn_out) # (B, 40)
-# # #         return indices, h_enc_new
-
-# # #     def decode(self, indices, h_dec):
-# # #         """For streaming: decode indices to audio."""
-# # #         # Convert indices (B, 40) to codebook vectors (B, C, 40)
-# # #         z_q = self.quantizer.embedding(indices) # (B, 40, C)
-# # #         z_q = z_q.permute(0, 2, 1) # (B, C, 40)
-        
-# # #         z_q_rnn_in = z_q.permute(0, 2, 1)
-# # #         z_q_rnn_out, h_dec_new = self.decoder_rnn(z_q_rnn_in, h_dec)
-# # #         z_q_rnn_out = z_q_rnn_out.permute(0, 2, 1)
-        
-# # #         x_hat = self.decoder(z_q_rnn_out) # (B, 1, 320)
-# # #         return x_hat, h_dec_new
-
-
-# # # # --- MODEL 2: TS3 Codec (Transformer) ---
-# # # class TS3_Codec(nn.Module):
-# # #     """
-# # #     A stateful, causal codec using a Causal Transformer as the core.
-# # #     This directly addresses your "Transformer" requirement.
-# # #     """
-# # #     def __init__(self):
-# # #         super().__init__()
-# # #         self.encoder = Encoder()
-# # #         self.quantizer = VectorQuantizer(VQ_EMBEDDINGS, LATENT_DIM, 0.25)
-# # #         self.decoder = Decoder()
-        
-# # #         self.encoder_tfm = CausalTransformerEncoder(LATENT_DIM, nhead=4, num_layers=2)
-# # #         self.decoder_tfm = CausalTransformerEncoder(LATENT_DIM, nhead=4, num_layers=2)
-    
-# # #     def forward(self, x, h_enc=None, h_dec=None):
-# # #         # x: (B, 1, T)
-# # #         z_e = self.encoder(x) # (B, C, T_latent)
-        
-# # #         # --- Stateful TFM ---
-# # #         z_e_tfm_in = z_e.permute(0, 2, 1) # (B, T_latent, C)
-# # #         z_e_tfm_out, h_enc_new = self.encoder_tfm(z_e_tfm_in, h_enc)
-# # #         z_e_tfm_out = z_e_tfm_out.permute(0, 2, 1) # (B, C, T_latent)
-# # #         # ---
-        
-# # #         z_q, vq_loss, indices = self.quantizer(z_e_tfm_out)
-
-# # #         # --- Stateful TFM ---
-# # #         z_q_tfm_in = z_q.permute(0, 2, 1) # (B, T_latent, C)
-# # #         z_q_tfm_out, h_dec_new = self.decoder_tfm(z_q_tfm_in, h_dec)
-# # #         z_q_tfm_out = z_q_tfm_out.permute(0, 2, 1) # (B, C, T_latent)
-# # #         # ---
-        
-# # #         x_hat = self.decoder(z_q_tfm_out)
-        
-# # #         return x_hat, vq_loss, (h_enc_new, h_dec_new)
-
-# # #     def encode(self, x, h_enc):
-# # #         """For streaming: encode audio to indices."""
-# # #         z_e = self.encoder(x) # (B, C, 40)
-# # #         z_e_tfm_in = z_e.permute(0, 2, 1)
-# # #         z_e_tfm_out, h_enc_new = self.encoder_tfm(z_e_tfm_in, h_enc)
-# # #         z_e_tfm_out = z_e_tfm_out.permute(0, 2, 1)
-        
-# # #         _, _, indices = self.quantizer(z_e_tfm_out) # (B, 40)
-# # #         return indices, h_enc_new
-
-# # #     def decode(self, indices, h_dec):
-# # #         """For streaming: decode indices to audio."""
-# # #         z_q = self.quantizer.embedding(indices) # (B, 40, C)
-        
-# # #         # TFM model input is (B, 40, C)
-# # #         z_q_tfm_out, h_dec_new = self.decoder_tfm(z_q, h_dec)
-# # #         z_q_tfm_out = z_q_tfm_out.permute(0, 2, 1) # (B, C, 40)
-        
-# # #         x_hat = self.decoder(z_q_tfm_out) # (B, 1, 320)
-# # #         return x_hat, h_dec_new
-
-# # # # --- MODEL 3: ScoreDec (Diffusion Post-Filter) ---
-
-# # # class SinusoidalPosEmb(nn.Module):
-# # #     def __init__(self, dim):
-# # #         super().__init__()
-# # #         self.dim = dim
-
-# # #     def forward(self, x):
-# # #         half_dim = self.dim // 2
-# # #         emb = math.log(10000) / (half_dim - 1)
-# # #         emb = torch.exp(torch.arange(half_dim, device=x.device) * -emb)
-# # #         emb = x[:, None] * emb[None, :]
-# # #         return torch.cat((emb.sin(), emb.cos()), dim=-1)
-
-# # # class DiffusionBlock(nn.Module):
-# # #     """A single U-Net block for the diffusion model."""
-# # #     def __init__(self, in_channels, out_channels, time_emb_dim, cond_dim):
-# # #         super().__init__()
-# # #         self.time_mlp = nn.Linear(time_emb_dim, out_channels)
-# # #         self.cond_mlp = nn.Linear(cond_dim, out_channels)
-        
-# # #         self.conv1 = CausalConv1d(in_channels, out_channels, kernel_size=3, padding=1)
-# # #         self.conv2 = CausalConv1d(out_channels, out_channels, kernel_size=3, padding=1)
-# # #         self.bn1 = nn.BatchNorm1d(out_channels)
-# # #         self.bn2 = nn.BatchNorm1d(out_channels)
-# # #         self.relu = nn.ReLU()
-
-# # #     def forward(self, x, t_emb, cond_emb):
-# # #         h = self.relu(self.bn1(self.conv1(x)))
-        
-# # #         # Add time and condition embeddings
-# # #         time_emb = self.relu(self.time_mlp(t_emb))
-# # #         cond_emb = self.relu(self.cond_mlp(cond_emb))
-# # #         h = h + time_emb.unsqueeze(-1) + cond_emb.unsqueeze(-1)
-        
-# # #         h = self.relu(self.bn2(self.conv2(h)))
-# # #         return h
-
-# # # class DiffusionUNet1D(nn.Module):
-# # #     """
-# # #     A 1D *CAUSAL* Denoising model, conditioned on the low-quality codec output.
-# # #     This is a simple "WaveNet" style stack, not a U-Net, to maintain causality.
-# # #     """
-# # #     def __init__(self, in_channels=1, model_channels=64, time_emb_dim=256, cond_dim=1):
-# # #         super().__init__()
-        
-# # #         # --- Simple Causal Stack ---
-# # #         self.time_mlp_simple = nn.Sequential(SinusoidalPosEmb(time_emb_dim), nn.Linear(time_emb_dim, model_channels), nn.ReLU())
-# # #         self.cond_proj_simple = CausalConv1d(cond_dim, model_channels, 1)
-# # #         self.in_conv = CausalConv1d(in_channels, model_channels, 1)
-        
-# # #         self.blocks = nn.ModuleList([
-# # #             CausalConv1d(model_channels, model_channels, 3, padding=1) for _ in range(4) # 4 residual blocks
-# # #         ])
-# # #         self.out_conv = CausalConv1d(model_channels, in_channels, 1)
-# # #         # --- End Simple Causal Stack ---
-
-# # #     def forward(self, x, time, cond):
-# # #         # t_emb shape: (B, C, 1)
-# # #         t_emb = self.time_mlp_simple(time).unsqueeze(-1) 
-# # #         # c_emb shape: (B, C, T)
-# # #         c_emb = self.cond_proj_simple(cond) 
-# # #         # x_in shape: (B, C, T)
-# # #         x_in = self.in_conv(x) 
-        
-# # #         # Add time and condition embeddings
-# # #         h = x_in + t_emb + c_emb 
-# # #         for block in self.blocks:
-# # #             h = block(h) + h # Residual connection
-# # #         return self.out_conv(h)
-
-# # # class ScoreDecPostFilter(nn.Module):
-# # #     """
-# # #     Wraps the diffusion U-Net and provides the enhancement logic.
-# # #     This is what is called by the streaming/evaluation tabs.
-# # #     """
-# # #     def __init__(self, timesteps=50, model_channels=64):
-# # #         super().__init__()
-# # #         self.timesteps = timesteps
-# # #         self.model = DiffusionUNet1D(model_channels=model_channels)
-        
-# # #         betas = torch.linspace(1e-4, 0.02, timesteps)
-# # #         alphas = 1. - betas
-# # #         alphas_cumprod = torch.cumprod(alphas, axis=0)
-
-# # #         self.register_buffer('betas', betas)
-# # #         self.register_buffer('alphas_cumprod', alphas_cumprod)
-# # #         self.register_buffer('alphas', alphas)
-        
-# # #     def q_sample(self, x_start, t, noise=None):
-# # #         """Forward diffusion: noise the clean signal."""
-# # #         if noise is None: noise = torch.randn_like(x_start)
-# # #         sqrt_alphas_cumprod_t = self.alphas_cumprod[t].sqrt().view(x_start.shape[0], 1, 1)
-# # #         sqrt_one_minus_alphas_cumprod_t = (1. - self.alphas_cumprod[t]).sqrt().view(x_start.shape[0], 1, 1)
-# # #         return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
-
-# # #     @torch.no_grad()
-# # #     def p_sample(self, x_t, t, cond):
-# # #         """One step of the reverse diffusion process."""
-# # #         t_tensor = torch.full((x_t.shape[0],), t, device=x_t.device, dtype=torch.long)
-# # #         alpha_t = self.alphas[t].view(-1, 1, 1)
-# # #         alpha_cumprod_t = self.alphas_cumprod[t].view(-1, 1, 1)
-        
-# # #         predicted_noise = self.model(x_t, t_tensor.float(), cond)
-        
-# # #         # DDPM sampling step
-# # #         x_prev = (x_t - ((1-alpha_t) / (1-alpha_cumprod_t).sqrt()) * predicted_noise) / alpha_t.sqrt()
-        
-# # #         if t > 0:
-# # #             noise = torch.randn_like(x_t)
-# # #             alpha_cumprod_prev_t = self.alphas_cumprod[t-1]
-# # #             posterior_variance = (1-alpha_cumprod_prev_t) / (1-alpha_cumprod_t) * self.betas[t]
-# # #             x_prev += torch.sqrt(posterior_variance.view(-1, 1, 1)) * noise
-# # #         return x_prev
-
-# # #     @torch.no_grad()
-# # #     def enhance(self, x_low_quality, timesteps=10):
-# # #         """
-# # #         The main enhancement function.
-# # #         x_low_quality is the output from the GRU_Codec.
-# # #         This is SLOW and NOT real-time.
-# # #         """
-# # #         # Start from the low-quality audio, but add noise
-# # #         t_start = timesteps - 1
-# # #         x_t = self.q_sample(x_low_quality, torch.tensor([t_start], device=x_low_quality.device))
-        
-# # #         for i in reversed(range(timesteps)):
-# # #             x_t = self.p_sample(x_t, i, cond=x_low_quality)
-            
-# # #         return torch.tanh(x_t)
-
-
-# # # # --- TRADITIONAL CODECS (For Baseline Comparison) ---
-# # # class MuLawCodec:
-# # #     def __init__(self, quantization_channels=256): self.mu = float(quantization_channels - 1)
-# # #     def encode(self, x):
-# # #         mu_t = torch.tensor(self.mu, device=x.device, dtype=torch.float32)
-# # #         encoded = torch.sign(x) * torch.log1p(mu_t * torch.abs(x)) / torch.log1p(mu_t)
-# # #         return (((encoded + 1) / 2 * self.mu) + 0.5).to(torch.uint8)
-# # #     def decode(self, z):
-# # #         z_float = z.to(torch.float32)
-# # #         mu_t = torch.tensor(self.mu, device=z.device, dtype=torch.float32)
-# # #         y = (z_float / self.mu) * 2.0 - 1.0
-# # #         return (torch.sign(y) * (1.0 / self.mu) * (torch.pow(1.0 + self.mu, torch.abs(y)) - 1.0)).unsqueeze(1)
-
-# # # class ALawCodec:
-# # #     def __init__(self): self.A = 87.6
-# # #     def encode(self, x):
-# # #         a_t = torch.tensor(self.A, device=x.device, dtype=torch.float32)
-# # #         abs_x = torch.abs(x)
-# # #         encoded = torch.zeros_like(x)
-# # #         cond = abs_x < (1 / self.A)
-# # #         encoded[cond] = torch.sign(x[cond]) * (a_t * abs_x[cond]) / (1 + torch.log(a_t))
-# # #         encoded[~cond] = torch.sign(x[~cond]) * (1 + torch.log(a_t * abs_x[~cond])) / (1 + torch.log(a_t))
-# # #         return (((encoded + 1) / 2 * 255) + 0.5).to(torch.uint8)
-# # #     def decode(self, z):
-# # #         z_float = z.to(torch.float32)
-# # #         a_t = torch.tensor(self.A, device=z.device, dtype=torch.float32)
-# # #         y = (z_float / 127.5) - 1.0
-# # #         abs_y = torch.abs(y)
-# # #         decoded = torch.zeros_like(y)
-# # #         cond = abs_y < (1 / (1 + torch.log(a_t)))
-# # #         decoded[cond] = torch.sign(y[cond]) * (abs_y[cond] * (1 + torch.log(a_t))) / a_t
-# # #         decoded[~cond] = torch.sign(y[~cond]) * torch.exp(abs_y[~cond] * (1 + torch.log(a_t)) - 1) / a_t
-# # #         return decoded.unsqueeze(1)
-
-# # # # --- DATASET & TRAINING ---
-# # # TRAIN_CHUNK_SIZE = 16000 # 1 second
-
-# # # class AudioChunkDataset(Dataset):
-# # #     def __init__(self, directory, chunk_size=TRAIN_CHUNK_SIZE, sample_rate=16000):
-# # #         self.chunk_size, self.sample_rate = chunk_size, sample_rate
-# # #         self.file_paths = [os.path.join(r, f) for r, _, fs in os.walk(directory) for f in fs if f.lower().endswith(('.wav', '.flac'))]
-# # #         if not self.file_paths: raise ValueError("No audio files found.")
-# # #     def __len__(self): return len(self.file_paths)
-# # #     def __getitem__(self, idx):
-# # #         try:
-# # #             waveform, sr = torchaudio.load(self.file_paths[idx])
-# # #             if sr != self.sample_rate: waveform = torchaudio.transforms.Resample(sr, self.sample_rate)(waveform)
-# # #             if waveform.shape[0] > 1: waveform = torch.mean(waveform, dim=0, keepdim=True)
-# # #             if waveform.shape[1] > self.chunk_size:
-# # #                 start = np.random.randint(0, waveform.shape[1] - self.chunk_size)
-# # #                 waveform = waveform[:, start:start + self.chunk_size]
-# # #             else:
-# # #                 waveform = F.pad(waveform, (0, self.chunk_size - waveform.shape[1]))
-# # #             return waveform
-# # #         except Exception as e:
-# # #             print(f"Warning: Skipping file {self.file_paths[idx]}. Error: {e}")
-# # #             return torch.zeros((1, self.chunk_size))
-
-# # # def train_model(dataset_path, epochs, learning_rate, batch_size, model_save_path, progress_callback, stop_event, model_type):
-# # #     """
-# # #     Main training function. Now handles 'gru', 'transformer', and 'scoredec' types.
-# # #     """
-# # #     try:
-# # #         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# # #         progress_callback.emit(f"Using device: {device}")
-        
-# # #         dataset = AudioChunkDataset(directory=dataset_path)
-# # #         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
-# # #         progress_callback.emit(f"Dataset loaded with {len(dataset)} files.")
-
-# # #         if model_type == 'gru':
-# # #             model = GRU_Codec().to(device)
-# # #             optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-# # #             stft_criterion = MultiResolutionSTFTLoss().to(device)
-# # #             l1_criterion = nn.L1Loss().to(device)
-# # #             progress_callback.emit(f"Starting training for GRU_Codec model...")
-        
-# # #         elif model_type == 'transformer':
-# # #             model = TS3_Codec().to(device)
-# # #             optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-# # #             stft_criterion = MultiResolutionSTFTLoss().to(device)
-# # #             l1_criterion = nn.L1Loss().to(device)
-# # #             progress_callback.emit(f"Starting training for TS3_Codec model...")
-        
-# # #         elif model_type == 'scoredec':
-# # #             progress_callback.emit("--- Starting ScoreDec Post-Filter Training ---")
-# # #             progress_callback.emit("Loading pre-trained GRU_Codec...")
-# # #             try:
-# # #                 gru_codec = GRU_Codec().to(device)
-# # #                 gru_codec.load_state_dict(torch.load("low_latency_codec_gru.pth", map_location=device))
-# # #                 gru_codec.eval()
-# # #                 for param in gru_codec.parameters():
-# # #                     param.requires_grad = False
-# # #                 progress_callback.emit("GRU_Codec loaded and frozen.")
-# # #             except FileNotFoundError:
-# # #                 progress_callback.emit("ERROR: 'low_latency_codec_gru.pth' not found. You must train the GRU_Codec first.")
-# # #                 return
-            
-# # #             model = ScoreDecPostFilter().to(device)
-# # #             optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-# # #             l1_criterion = nn.L1Loss().to(device)
-# # #             progress_callback.emit("Starting training for ScoreDec model...")
-            
-# # #         else:
-# # #             raise ValueError(f"Unknown model type for training: {model_type}")
-
-# # #         # --- Main Training Loop ---
-# # #         for epoch in range(epochs):
-# # #             if stop_event.is_set():
-# # #                 progress_callback.emit("Training stopped by user."); break
-            
-# # #             for i, data in enumerate(dataloader):
-# # #                 inputs = data.to(device)
-# # #                 optimizer.zero_grad()
-                
-# # #                 if model_type in ['gru', 'transformer']:
-# # #                     h_enc, h_dec = None, None # Reset state per batch
-# # #                     x_hat, vq_loss, (h_enc, h_dec) = model(inputs, h_enc, h_dec)
-                    
-# # #                     # --- FIX: Defensively pad output to match input length ---
-# # #                     # This is the most likely source of the STFT error
-# # #                     input_len = inputs.shape[-1]
-# # #                     output_len = x_hat.shape[-1]
-                    
-# # #                     if output_len < input_len:
-# # #                         # Pad x_hat on the right if it's shorter
-# # #                         padding = input_len - output_len
-# # #                         x_hat = F.pad(x_hat, (0, padding))
-# # #                     elif output_len > input_len:
-# # #                         # Trim x_hat if it's longer
-# # #                         x_hat = x_hat[..., :input_len]
-# # #                     # --- End Fix ---
-                    
-# # #                     stft_loss = stft_criterion(x_hat, inputs)
-# # #                     l1_loss = l1_criterion(x_hat, inputs)
-# # #                     loss = stft_loss + 0.1 * l1_loss + vq_loss
-                    
-# # #                     if i % 20 == 19:
-# # #                         progress_callback.emit(f"[Epoch {epoch + 1}, Batch {i + 1}] Loss: {loss.item():.5f} (STFT: {stft_loss.item():.4f}, VQ: {vq_loss.item():.4f})")
-
-# # #                 elif model_type == 'scoredec':
-# # #                     with torch.no_grad():
-# # #                         x_hat_low_quality, _, _ = gru_codec(inputs)
-                        
-# # #                         # --- FIX: Ensure low-quality output matches input ---
-# # #                         input_len = inputs.shape[-1]
-# # #                         output_len = x_hat_low_quality.shape[-1]
-# # #                         if output_len < input_len:
-# # #                             padding = input_len - output_len
-# # #                             x_hat_low_quality = F.pad(x_hat_low_quality, (0, padding))
-# # #                         elif output_len > input_len:
-# # #                             x_hat_low_quality = x_hat_low_quality[..., :input_len]
-# # #                         # --- End Fix ---
-                        
-# # #                         x_hat_low_quality = x_hat_low_quality.detach()
-                    
-# # #                     # Train diffusion model
-# # #                     t = torch.randint(0, model.timesteps, (inputs.shape[0],), device=device).long()
-# # #                     x_t, noise = model.q_sample(x_start=inputs, t=t)
-                    
-# # #                     predicted_noise = model.model(x_t, t.float(), cond=x_hat_low_quality)
-# # #                     loss = l1_criterion(predicted_noise, noise)
-                    
-# # #                     if i % 20 == 19:
-# # #                         progress_callback.emit(f"[Epoch {epoch + 1}, Batch {i + 1}] Denoising Loss: {loss.item():.5f}")
-
-# # #                 loss.backward()
-# # #                 optimizer.step()
-
-# # #             progress_callback.emit(f"--- Epoch {epoch + 1} finished ---")
-
-# # #         if not stop_event.is_set():
-# # #             progress_callback.emit("Training finished. Saving model...")
-# # #             torch.save(model.state_dict(), model_save_path)
-# # #             progress_callback.emit(f"Model saved to {model_save_path}")
-# # #     except Exception as e:
-# # #         progress_callback.emit(f"ERROR in training: {e}")
-
-
-# # import torch
-# # import torch.nn as nn
-# # import torch.optim as optim
-# # from torch.utils.data import Dataset, DataLoader
-# # import torchaudio
-# # import os
-# # import numpy as np
-# # import torch.nn.functional as F
-# # import math
-
-# # # --- Perceptual Loss Function ---
-# # class MultiResolutionSTFTLoss(nn.Module):
-# #     """
-# #     Multi-resolution STFT loss, common in audio generation models.
-# #     This is a key part of achieving high quality (PESQ/STOI).
-# #     """
-# #     def __init__(self, fft_sizes=[1024, 2048, 512], hop_sizes=[120, 240, 50], win_lengths=[600, 1200, 240]):
-# #         super(MultiResolutionSTFTLoss, self).__init__()
-# #         self.fft_sizes = fft_sizes
-# #         self.hop_sizes = hop_sizes
-# #         self.win_lengths = win_lengths
-# #         self.window = torch.hann_window
-# #         assert len(fft_sizes) == len(hop_sizes) == len(win_lengths)
-
-# #     def forward(self, y_hat, y):
-# #         sc_loss, mag_loss = 0.0, 0.0
-# #         for fft, hop, win in zip(self.fft_sizes, self.hop_sizes, self.win_lengths):
-# #             window = self.window(win, device=y.device)
-# #             spec_hat = torch.stft(y_hat.squeeze(1), n_fft=fft, hop_length=hop, win_length=win, window=window, return_complex=True)
-# #             spec = torch.stft(y.squeeze(1), n_fft=fft, hop_length=hop, win_length=win, window=window, return_complex=True)
-            
-# #             sc_loss += torch.norm(torch.abs(spec) - torch.abs(spec_hat), p='fro') / torch.norm(torch.abs(spec), p='fro')
-# #             mag_loss += F.l1_loss(torch.log(torch.abs(spec).clamp(min=1e-9)), torch.log(torch.abs(spec_hat).clamp(min=1e-9)))
-            
-# #         return (sc_loss / len(self.fft_sizes)) + (mag_loss / len(self.fft_sizes))
-
-# # # --- Causal Convolution ---
-# # class CausalConv1d(nn.Conv1d):
-# #     """
-# #     A 1D convolution that is causal (cannot see the future).
-# #     This is critical for the < 20ms latency goal.
-# #     """
-# #     def __init__(self, *args, **kwargs):
-# #         super().__init__(*args, **kwargs)
-# #         # Calculate the padding needed to make it causal
-# #         self.causal_padding = self.kernel_size[0] - 1
-
-# #     def forward(self, x):
-# #         # Pad on the left (past) only
-# #         return super().forward(F.pad(x, (self.causal_padding, 0)))
-
-# # class CausalConvTranspose1d(nn.ConvTranspose1d):
-# #     """
-# #     A 1D *transpose* convolution that is causal.
-# #     It removes output samples that would "see the future".
-# #     """
-# #     def __init__(self, *args, **kwargs):
-# #         super().__init__(*args, **kwargs)
-# #         self.causal_padding = self.kernel_size[0] - self.stride[0]
-
-# #     def forward(self, x):
-# #         x = super().forward(x)
-# #         # Remove the invalid, "future-seeing" samples from the end
-# #         if self.causal_padding != 0:
-# #             return x[..., :-self.causal_padding]
-# #         return x
-
-# # # --- Vector Quantizer (The heart of the *COMPRESSION*) ---
-# # class VectorQuantizer(nn.Module):
-# #     """
-# #     The Vector Quantizer (VQ) module. This is what enables low-bitrate compression.
-# #     It maps continuous latent vectors to a discrete set of "codes" from a codebook.
-# #     """
-# #     def __init__(self, num_embeddings, embedding_dim, commitment_cost):
-# #         super(VectorQuantizer, self).__init__()
-# #         self.num_embeddings = num_embeddings # Codebook size (e.g., 256)
-# #         self.embedding_dim = embedding_dim # Dimension of each code
-# #         self.commitment_cost = commitment_cost # 'beta' in VQ-VAE
-        
-# #         # The codebook
-# #         self.embedding = nn.Embedding(self.num_embeddings, self.embedding_dim)
-# #         self.embedding.weight.data.uniform_(-1.0 / self.num_embeddings, 1.0 / self.num_embeddings)
-
-# #     def forward(self, z_e):
-# #         # z_e shape: (B, C, T) -> (B*T, C)
-# #         z_e_flat = z_e.permute(0, 2, 1).contiguous().view(-1, self.embedding_dim)
-        
-# #         # Find the closest codebook vector (L2 distance)
-# #         distances = (torch.sum(z_e_flat**2, dim=1, keepdim=True) 
-# #                      + torch.sum(self.embedding.weight**2, dim=1)
-# #                      - 2 * torch.matmul(z_e_flat, self.embedding.weight.t()))
-        
-# #         # Get the indices of the closest vectors
-# #         encoding_indices = torch.argmin(distances, dim=1)
-        
-# #         # Quantize: Map indices back to codebook vectors
-# #         z_q = self.embedding(encoding_indices).view(z_e.shape[0], -1, self.embedding_dim)
-# #         z_q = z_q.permute(0, 2, 1).contiguous() # (B, C, T)
-
-# #         # VQ-VAE Loss (Commitment Loss)
-# #         e_loss = F.mse_loss(z_q.detach(), z_e) * self.commitment_cost
-# #         q_loss = F.mse_loss(z_q, z_e.detach())
-# #         vq_loss = q_loss + e_loss
-        
-# #         # Straight-Through Estimator (STE)
-# #         # This copies the gradient from z_q to z_e
-# #         z_q = z_e + (z_q - z_e).detach()
-        
-# #         return z_q, vq_loss, encoding_indices.view(z_e.shape[0], -1) # (B, T)
-
-# # # --- The New Codec Architecture Components ---
-# # # These are based on the SoundStream model, but simplified.
-
-# # HOP_SIZE = 320 # 20ms frame (320 samples / 16000 Hz = 0.02s)
-# # LATENT_DIM = 64
-# # VQ_EMBEDDINGS = 256 # 8 bits per code
-# # # 16000 bits/sec / 50 frames/sec = 320 bits/frame
-# # # 320 bits / 8 bits/index = 40 indices per frame
-# # NUM_QUANTIZERS = 40 # This is our 16kbps target (40 bytes * 50 fps = 2000 B/s = 16 kbps)
-
-# # class Encoder(nn.Module):
-# #     """
-# #     Causal encoder. Takes raw audio and produces latent vectors.
-# #     Takes a 320-sample chunk and produces 40 latent vectors.
-# #     Total stride must be 320 / 40 = 8.
-# #     """
-# #     def __init__(self):
-# #         super().__init__()
-# #         self.net = nn.Sequential(
-# #             CausalConv1d(1, 32, 7), nn.ELU(),
-# #             CausalConv1d(32, 64, 5, stride=2), nn.ELU(), # 320 -> 160
-# #             CausalConv1d(64, 64, 5, stride=2), nn.ELU(), # 160 -> 80
-# #             CausalConv1d(64, LATENT_DIM, 5, stride=2), nn.ELU() # 80 -> 40
-# #         )
-# #         # Output shape: (B, LATENT_DIM, 40)
-# #         # This is exactly what we need.
-
-# #     def forward(self, x):
-# #         return self.net(x)
-
-# # class Decoder(nn.Module):
-# #     """
-# #     Causal decoder. Takes quantized latents and reconstructs audio.
-# #     Must be the inverse of the Encoder.
-# #     """
-# #     def __init__(self):
-# #         super().__init__()
-# #         self.net = nn.Sequential(
-# #             CausalConvTranspose1d(LATENT_DIM, 64, 5, stride=2), nn.ELU(), # 40 -> 80
-# #             CausalConvTranspose1d(64, 64, 5, stride=2), nn.ELU(), # 80 -> 160
-# #             CausalConvTranspose1d(64, 32, 5, stride=2), nn.ELU(), # 160 -> 320
-# #             CausalConv1d(32, 1, 7), nn.Tanh() # Final output
-# #         )
-    
-# #     def forward(self, x):
-# #         return self.net(x)
-
-# # # --- Causal Transformer (for the Transformer-based Codec) ---
-# # class CausalTransformerEncoder(nn.Module):
-# #     def __init__(self, d_model, nhead, num_layers):
-# #         super().__init__()
-# #         self.d_model = d_model
-# #         layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
-# #         self.transformer = nn.TransformerEncoder(layer, num_layers=num_layers)
-    
-# #     def get_causal_mask(self, sz):
-# #         # Returns a mask of shape (sz, sz)
-# #         # FIX: Create a boolean mask where True means "masked out"
-# #         mask = torch.triu(torch.ones(sz, sz), diagonal=1) # (sz, sz) with 1s in upper triangle
-# #         return mask.to(torch.bool) # Convert to boolean
-
-# #     def forward(self, x, state):
-# #         # x shape: (B, T, C) e.g. (1, 40, 64)
-# #         # state shape: (B, S, C) e.g. (1, 100, 64)
-        
-# #         if state is None:
-# #             # First frame, no state
-# #             inp = x
-# #         else:
-# #             # Append new frame to old state
-# #             inp = torch.cat([state, x], dim=1)
-        
-# #         # We must limit the state size to avoid OOM
-# #         # Let's say, 10 frames of history (10 * 40 = 400 steps)
-# #         STATE_LEN = 400
-# #         if inp.shape[1] > STATE_LEN:
-# #             inp = inp[:, -STATE_LEN:, :]
-        
-# #         new_state = inp.detach() # The new state is the full input
-        
-# #         # Create a causal mask for the *full input sequence*
-# #         mask = self.get_causal_mask(inp.shape[1]).to(x.device)
-        
-# #         # Process the full sequence
-# #         out = self.transformer(inp, mask=mask)
-        
-# #         # Only return the *new* frames, corresponding to x
-# #         # This is how we make it stateful
-# #         out = out[:, -x.shape[1]:, :] # (B, T, C)
-        
-# #         return out, new_state
-
-
-# # # --- MODEL 1: GRU Codec (Fast) ---
-# # class GRU_Codec(nn.Module):
-# #     """
-# #     A stateful, causal codec using a GRU (RNN) as the core.
-# #     This is the "simpler neural approach" and is very fast.
-# #     """
-# #     def __init__(self):
-# #         super().__init__()
-# #         self.encoder = Encoder()
-# #         self.quantizer = VectorQuantizer(VQ_EMBEDDINGS, LATENT_DIM, 0.25)
-# #         self.decoder = Decoder()
-        
-# #         self.encoder_rnn = nn.GRU(LATENT_DIM, LATENT_DIM, batch_first=True)
-# #         self.decoder_rnn = nn.GRU(LATENT_DIM, LATENT_DIM, batch_first=True)
-    
-# #     def forward(self, x, h_enc=None, h_dec=None):
-# #         # x: (B, 1, T)
-# #         z_e = self.encoder(x) # (B, C, T_latent)
-        
-# #         # --- Stateful RNN ---
-# #         # (B, C, T_latent) -> (B, T_latent, C)
-# #         z_e_rnn_in = z_e.permute(0, 2, 1)
-# #         z_e_rnn_out, h_enc_new = self.encoder_rnn(z_e_rnn_in, h_enc)
-# #         # (B, T_latent, C) -> (B, C, T_latent)
-# #         z_e_rnn_out = z_e_rnn_out.permute(0, 2, 1)
-# #         # ---
-        
-# #         z_q, vq_loss, indices = self.quantizer(z_e_rnn_out)
-
-# #         # --- Stateful RNN ---
-# #         # (B, C, T_latent) -> (B, T_latent, C)
-# #         z_q_rnn_in = z_q.permute(0, 2, 1)
-# #         z_q_rnn_out, h_dec_new = self.decoder_rnn(z_q_rnn_in, h_dec)
-# #         # (B, T_latent, C) -> (B, C, T_latent)
-# #         z_q_rnn_out = z_q_rnn_out.permute(0, 2, 1)
-# #         # ---
-        
-# #         x_hat = self.decoder(z_q_rnn_out)
-        
-# #         return x_hat, vq_loss, (h_enc_new, h_dec_new)
-
-# #     def encode(self, x, h_enc):
-# #         """For streaming: encode audio to indices."""
-# #         z_e = self.encoder(x) # (B, C, 40)
-# #         z_e_rnn_in = z_e.permute(0, 2, 1)
-# #         z_e_rnn_out, h_enc_new = self.encoder_rnn(z_e_rnn_in, h_enc)
-# #         z_e_rnn_out = z_e_rnn_out.permute(0, 2, 1)
-        
-# #         # We don't need vq_loss here, just indices
-# #         _, _, indices = self.quantizer(z_e_rnn_out) # (B, 40)
-# #         return indices, h_enc_new
-
-# #     def decode(self, indices, h_dec):
-# #         """For streaming: decode indices to audio."""
-# #         # Convert indices (B, 40) to codebook vectors (B, C, 40)
-# #         z_q = self.quantizer.embedding(indices) # (B, 40, C)
-# #         z_q = z_q.permute(0, 2, 1) # (B, C, 40)
-        
-# #         z_q_rnn_in = z_q.permute(0, 2, 1)
-# #         z_q_rnn_out, h_dec_new = self.decoder_rnn(z_q_rnn_in, h_dec)
-# #         z_q_rnn_out = z_q_rnn_out.permute(0, 2, 1)
-        
-# #         x_hat = self.decoder(z_q_rnn_out) # (B, 1, 320)
-# #         return x_hat, h_dec_new
-
-
-# # # --- MODEL 2: TS3 Codec (Transformer) ---
-# # class TS3_Codec(nn.Module):
-# #     """
-# #     A stateful, causal codec using a Causal Transformer as the core.
-# #     This directly addresses your "Transformer" requirement.
-# #     """
-# #     def __init__(self):
-# #         super().__init__()
-# #         self.encoder = Encoder()
-# #         self.quantizer = VectorQuantizer(VQ_EMBEDDINGS, LATENT_DIM, 0.25)
-# #         self.decoder = Decoder()
-        
-# #         self.encoder_tfm = CausalTransformerEncoder(LATENT_DIM, nhead=4, num_layers=2)
-# #         self.decoder_tfm = CausalTransformerEncoder(LATENT_DIM, nhead=4, num_layers=2)
-    
-# #     def forward(self, x, h_enc=None, h_dec=None):
-# #         # x: (B, 1, T)
-# #         z_e = self.encoder(x) # (B, C, T_latent)
-        
-# #         # --- Stateful TFM ---
-# #         z_e_tfm_in = z_e.permute(0, 2, 1) # (B, T_latent, C)
-# #         z_e_tfm_out, h_enc_new = self.encoder_tfm(z_e_tfm_in, h_enc)
-# #         z_e_tfm_out = z_e_tfm_out.permute(0, 2, 1) # (B, C, T_latent)
-# #         # ---
-        
-# #         z_q, vq_loss, indices = self.quantizer(z_e_tfm_out)
-
-# #         # --- Stateful TFM ---
-# #         z_q_tfm_in = z_q.permute(0, 2, 1) # (B, T_latent, C)
-# #         z_q_tfm_out, h_dec_new = self.decoder_tfm(z_q_tfm_in, h_dec)
-# #         z_q_tfm_out = z_q_tfm_out.permute(0, 2, 1) # (B, C, T_latent)
-# #         # ---
-        
-# #         x_hat = self.decoder(z_q_tfm_out)
-        
-# #         return x_hat, vq_loss, (h_enc_new, h_dec_new)
-
-# #     def encode(self, x, h_enc):
-# #         """For streaming: encode audio to indices."""
-# #         z_e = self.encoder(x) # (B, C, 40)
-# #         z_e_tfm_in = z_e.permute(0, 2, 1)
-# #         z_e_tfm_out, h_enc_new = self.encoder_tfm(z_e_tfm_in, h_enc)
-# #         z_e_tfm_out = z_e_tfm_out.permute(0, 2, 1)
-        
-# #         _, _, indices = self.quantizer(z_e_tfm_out) # (B, 40)
-# #         return indices, h_enc_new
-
-# #     def decode(self, indices, h_dec):
-# #         """For streaming: decode indices to audio."""
-# #         z_q = self.quantizer.embedding(indices) # (B, 40, C)
-        
-# #         # TFM model input is (B, 40, C)
-# #         z_q_tfm_out, h_dec_new = self.decoder_tfm(z_q, h_dec)
-# #         z_q_tfm_out = z_q_tfm_out.permute(0, 2, 1) # (B, C, 40)
-        
-# #         x_hat = self.decoder(z_q_tfm_out) # (B, 1, 320)
-# #         return x_hat, h_dec_new
-
-# # # --- MODEL 3: ScoreDec (Diffusion Post-Filter) ---
-
-# # class SinusoidalPosEmb(nn.Module):
-# #     def __init__(self, dim):
-# #         super().__init__()
-# #         self.dim = dim
-
-# #     def forward(self, x):
-# #         half_dim = self.dim // 2
-# #         emb = math.log(10000) / (half_dim - 1)
-# #         emb = torch.exp(torch.arange(half_dim, device=x.device) * -emb)
-# #         emb = x[:, None] * emb[None, :]
-# #         return torch.cat((emb.sin(), emb.cos()), dim=-1)
-
-# # class DiffusionBlock(nn.Module):
-# #     """A single U-Net block for the diffusion model."""
-# #     def __init__(self, in_channels, out_channels, time_emb_dim, cond_dim):
-# #         super().__init__()
-# #         self.time_mlp = nn.Linear(time_emb_dim, out_channels)
-# #         self.cond_mlp = nn.Linear(cond_dim, out_channels)
-        
-# #         self.conv1 = CausalConv1d(in_channels, out_channels, kernel_size=3, padding=1)
-# #         self.conv2 = CausalConv1d(out_channels, out_channels, kernel_size=3, padding=1)
-# #         self.bn1 = nn.BatchNorm1d(out_channels)
-# #         self.bn2 = nn.BatchNorm1d(out_channels)
-# #         self.relu = nn.ReLU()
-
-# #     def forward(self, x, t_emb, cond_emb):
-# #         h = self.relu(self.bn1(self.conv1(x)))
-        
-# #         # Add time and condition embeddings
-# #         time_emb = self.relu(self.time_mlp(t_emb))
-# #         cond_emb = self.relu(self.cond_mlp(cond_emb))
-# #         h = h + time_emb.unsqueeze(-1) + cond_emb.unsqueeze(-1)
-        
-# #         h = self.relu(self.bn2(self.conv2(h)))
-# #         return h
-
-# # class DiffusionUNet1D(nn.Module):
-# #     """
-# #     A 1D *CAUSAL* Denoising model, conditioned on the low-quality codec output.
-# #     This is a simple "WaveNet" style stack, not a U-Net, to maintain causality.
-# #     """
-# #     def __init__(self, in_channels=1, model_channels=64, time_emb_dim=256, cond_dim=1):
-# #         super().__init__()
-        
-# #         # --- Simple Causal Stack ---
-# #         self.time_mlp_simple = nn.Sequential(SinusoidalPosEmb(time_emb_dim), nn.Linear(time_emb_dim, model_channels), nn.ReLU())
-# #         self.cond_proj_simple = CausalConv1d(cond_dim, model_channels, 1)
-# #         self.in_conv = CausalConv1d(in_channels, model_channels, 1)
-        
-# #         self.blocks = nn.ModuleList([
-# #             CausalConv1d(model_channels, model_channels, 3, padding=1) for _ in range(4) # 4 residual blocks
-# #         ])
-# #         self.out_conv = CausalConv1d(model_channels, in_channels, 1)
-# #         # --- End Simple Causal Stack ---
-
-# #     def forward(self, x, time, cond):
-# #         # t_emb shape: (B, C, 1)
-# #         t_emb = self.time_mlp_simple(time).unsqueeze(-1) 
-# #         # c_emb shape: (B, C, T)
-# #         c_emb = self.cond_proj_simple(cond) 
-# #         # x_in shape: (B, C, T)
-# #         x_in = self.in_conv(x) 
-        
-# #         # Add time and condition embeddings
-# #         h = x_in + t_emb + c_emb 
-# #         for block in self.blocks:
-# #             h = block(h) + h # Residual connection
-# #         return self.out_conv(h)
-
-# # class ScoreDecPostFilter(nn.Module):
-# #     """
-# #     Wraps the diffusion U-Net and provides the enhancement logic.
-# #     This is what is called by the streaming/evaluation tabs.
-# #     """
-# #     def __init__(self, timesteps=50, model_channels=64):
-# #         super().__init__()
-# #         self.timesteps = timesteps
-# #         self.model = DiffusionUNet1D(model_channels=model_channels)
-        
-# #         betas = torch.linspace(1e-4, 0.02, timesteps)
-# #         alphas = 1. - betas
-# #         alphas_cumprod = torch.cumprod(alphas, axis=0)
-
-# #         self.register_buffer('betas', betas)
-# #         self.register_buffer('alphas_cumprod', alphas_cumprod)
-# #         self.register_buffer('alphas', alphas)
-        
-# #     def q_sample(self, x_start, t, noise=None):
-# #         """Forward diffusion: noise the clean signal."""
-# #         if noise is None: noise = torch.randn_like(x_start)
-# #         sqrt_alphas_cumprod_t = self.alphas_cumprod[t].sqrt().view(x_start.shape[0], 1, 1)
-# #         sqrt_one_minus_alphas_cumprod_t = (1. - self.alphas_cumprod[t]).sqrt().view(x_start.shape[0], 1, 1)
-        
-# #         # FIX: Return both the noised tensor and the noise itself
-# #         noised_tensor = sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
-# #         return noised_tensor, noise
-
-# #     @torch.no_grad()
-# #     def p_sample(self, x_t, t, cond):
-# #         """One step of the reverse diffusion process."""
-# #         t_tensor = torch.full((x_t.shape[0],), t, device=x_t.device, dtype=torch.long)
-# #         alpha_t = self.alphas[t].view(-1, 1, 1)
-# #         alpha_cumprod_t = self.alphas_cumprod[t].view(-1, 1, 1)
-        
-# #         predicted_noise = self.model(x_t, t_tensor.float(), cond)
-        
-# #         # DDPM sampling step
-# #         x_prev = (x_t - ((1-alpha_t) / (1-alpha_cumprod_t).sqrt()) * predicted_noise) / alpha_t.sqrt()
-        
-# #         if t > 0:
-# #             noise = torch.randn_like(x_t)
-# #             alpha_cumprod_prev_t = self.alphas_cumprod[t-1]
-# #             posterior_variance = (1-alpha_cumprod_prev_t) / (1-alpha_cumprod_t) * self.betas[t]
-# #             x_prev += torch.sqrt(posterior_variance.view(-1, 1, 1)) * noise
-# #         return x_prev
-
-# #     @torch.no_grad()
-# #     def enhance(self, x_low_quality, timesteps=10):
-# #         """
-# #         The main enhancement function.
-# #         x_low_quality is the output from the GRU_Codec.
-# #         This is SLOW and NOT real-time.
-# #         """
-# #         # Start from the low-quality audio, but add noise
-# #         t_start = timesteps - 1
-# #         x_t = self.q_sample(x_low_quality, torch.tensor([t_start], device=x_low_quality.device))
-        
-# #         for i in reversed(range(timesteps)):
-# #             x_t = self.p_sample(x_t, i, cond=x_low_quality)
-            
-# #         return torch.tanh(x_t)
-
-
-# # # --- TRADITIONAL CODECS (For Baseline Comparison) ---
-# # class MuLawCodec:
-# #     def __init__(self, quantization_channels=256): self.mu = float(quantization_channels - 1)
-# #     def encode(self, x):
-# #         mu_t = torch.tensor(self.mu, device=x.device, dtype=torch.float32)
-# #         encoded = torch.sign(x) * torch.log1p(mu_t * torch.abs(x)) / torch.log1p(mu_t)
-# #         return (((encoded + 1) / 2 * self.mu) + 0.5).to(torch.uint8)
-# #     def decode(self, z):
-# #         z_float = z.to(torch.float32)
-# #         mu_t = torch.tensor(self.mu, device=z.device, dtype=torch.float32)
-# #         y = (z_float / self.mu) * 2.0 - 1.0
-# #         return (torch.sign(y) * (1.0 / self.mu) * (torch.pow(1.0 + self.mu, torch.abs(y)) - 1.0)).unsqueeze(1)
-
-# # class ALawCodec:
-# #     def __init__(self): self.A = 87.6
-# #     def encode(self, x):
-# #         a_t = torch.tensor(self.A, device=x.device, dtype=torch.float32)
-# #         abs_x = torch.abs(x)
-# #         encoded = torch.zeros_like(x)
-# #         cond = abs_x < (1 / self.A)
-# #         encoded[cond] = torch.sign(x[cond]) * (a_t * abs_x[cond]) / (1 + torch.log(a_t))
-# #         encoded[~cond] = torch.sign(x[~cond]) * (1 + torch.log(a_t * abs_x[~cond])) / (1 + torch.log(a_t))
-# #         return (((encoded + 1) / 2 * 255) + 0.5).to(torch.uint8)
-# #     def decode(self, z):
-# #         z_float = z.to(torch.float32)
-# #         a_t = torch.tensor(self.A, device=z.device, dtype=torch.float32)
-# #         y = (z_float / 127.5) - 1.0
-# #         abs_y = torch.abs(y)
-# #         decoded = torch.zeros_like(y)
-# #         cond = abs_y < (1 / (1 + torch.log(a_t)))
-# #         decoded[cond] = torch.sign(y[cond]) * (abs_y[cond] * (1 + torch.log(a_t))) / a_t
-# #         decoded[~cond] = torch.sign(y[~cond]) * torch.exp(abs_y[~cond] * (1 + torch.log(a_t)) - 1) / a_t
-# #         return decoded.unsqueeze(1)
-
-# # # --- DATASET & TRAINING ---
-# # TRAIN_CHUNK_SIZE = 16000 # 1 second
-
-# # class AudioChunkDataset(Dataset):
-# #     def __init__(self, directory, chunk_size=TRAIN_CHUNK_SIZE, sample_rate=16000):
-# #         self.chunk_size, self.sample_rate = chunk_size, sample_rate
-# #         self.file_paths = [os.path.join(r, f) for r, _, fs in os.walk(directory) for f in fs if f.lower().endswith(('.wav', '.flac'))]
-# #         if not self.file_paths: raise ValueError("No audio files found.")
-# #     def __len__(self): return len(self.file_paths)
-# #     def __getitem__(self, idx):
-# #         try:
-# #             waveform, sr = torchaudio.load(self.file_paths[idx])
-# #             if sr != self.sample_rate: waveform = torchaudio.transforms.Resample(sr, self.sample_rate)(waveform)
-# #             if waveform.shape[0] > 1: waveform = torch.mean(waveform, dim=0, keepdim=True)
-# #             if waveform.shape[1] > self.chunk_size:
-# #                 start = np.random.randint(0, waveform.shape[1] - self.chunk_size)
-# #                 waveform = waveform[:, start:start + self.chunk_size]
-# #             else:
-# #                 waveform = F.pad(waveform, (0, self.chunk_size - waveform.shape[1]))
-# #             return waveform
-# #         except Exception as e:
-# #             print(f"Warning: Skipping file {self.file_paths[idx]}. Error: {e}")
-# #             return torch.zeros((1, self.chunk_size))
-
-# # def train_model(dataset_path, epochs, learning_rate, batch_size, model_save_path, progress_callback, stop_event, model_type):
-# #     """
-# #     Main training function. Now handles 'gru', 'transformer', and 'scoredec' types.
-# #     """
-# #     try:
-# #         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# #         progress_callback.emit(f"Using device: {device}")
-        
-# #         dataset = AudioChunkDataset(directory=dataset_path)
-# #         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
-# #         progress_callback.emit(f"Dataset loaded with {len(dataset)} files.")
-
-# #         if model_type == 'gru':
-# #             model = GRU_Codec().to(device)
-# #             optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-# #             stft_criterion = MultiResolutionSTFTLoss().to(device)
-# #             l1_criterion = nn.L1Loss().to(device)
-# #             progress_callback.emit(f"Starting training for GRU_Codec model...")
-        
-# #         elif model_type == 'transformer':
-# #             model = TS3_Codec().to(device)
-# #             optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-# #             stft_criterion = MultiResolutionSTFTLoss().to(device)
-# #             l1_criterion = nn.L1Loss().to(device)
-# #             progress_callback.emit(f"Starting training for TS3_Codec model...")
-        
-# #         elif model_type == 'scoredec':
-# #             progress_callback.emit("--- Starting ScoreDec Post-Filter Training ---")
-# #             progress_callback.emit("Loading pre-trained GRU_Codec...")
-# #             try:
-# #                 gru_codec = GRU_Codec().to(device)
-# #                 gru_codec.load_state_dict(torch.load("low_latency_codec_gru.pth", map_location=device))
-# #                 gru_codec.eval()
-# #                 for param in gru_codec.parameters():
-# #                     param.requires_grad = False
-# #                 progress_callback.emit("GRU_Codec loaded and frozen.")
-# #             except FileNotFoundError:
-# #                 progress_callback.emit("ERROR: 'low_latency_codec_gru.pth' not found. You must train the GRU_Codec first.")
-# #                 return
-            
-# #             model = ScoreDecPostFilter().to(device)
-# #             optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-# #             l1_criterion = nn.L1Loss().to(device)
-# #             progress_callback.emit("Starting training for ScoreDec model...")
-            
-# #         else:
-# #             raise ValueError(f"Unknown model type for training: {model_type}")
-
-# #         # --- Main Training Loop ---
-# #         for epoch in range(epochs):
-# #             if stop_event.is_set():
-# #                 progress_callback.emit("Training stopped by user."); break
-            
-# #             for i, data in enumerate(dataloader):
-# #                 inputs = data.to(device)
-# #                 optimizer.zero_grad()
-                
-# #                 if model_type in ['gru', 'transformer']:
-# #                     h_enc, h_dec = None, None # Reset state per batch
-# #                     x_hat, vq_loss, (h_enc, h_dec) = model(inputs, h_enc, h_dec)
-                    
-# #                     # --- FIX: Defensively pad output to match input length ---
-# #                     # This is the most likely source of the STFT error
-# #                     input_len = inputs.shape[-1]
-# #                     output_len = x_hat.shape[-1]
-                    
-# #                     if output_len < input_len:
-# #                         # Pad x_hat on the right if it's shorter
-# #                         padding = input_len - output_len
-# #                         x_hat = F.pad(x_hat, (0, padding))
-# #                     elif output_len > input_len:
-# #                         # Trim x_hat if it's longer
-# #                         x_hat = x_hat[..., :input_len]
-# #                     # --- End Fix ---
-                    
-# #                     stft_loss = stft_criterion(x_hat, inputs)
-# #                     l1_loss = l1_criterion(x_hat, inputs)
-# #                     loss = stft_loss + 0.1 * l1_loss + vq_loss
-                    
-# #                     if i % 20 == 19:
-# #                         progress_callback.emit(f"[Epoch {epoch + 1}, Batch {i + 1}] Loss: {loss.item():.5f} (STFT: {stft_loss.item():.4f}, VQ: {vq_loss.item():.4f})")
-
-# #                 elif model_type == 'scoredec':
-# #                     with torch.no_grad():
-# #                         x_hat_low_quality, _, _ = gru_codec(inputs)
-                        
-# #                         # --- FIX: Ensure low-quality output matches input ---
-# #                         input_len = inputs.shape[-1]
-# #                         output_len = x_hat_low_quality.shape[-1]
-# #                         if output_len < input_len:
-# #                             padding = input_len - output_len
-# #                             x_hat_low_quality = F.pad(x_hat_low_quality, (0, padding))
-# #                         elif output_len > input_len:
-# #                             x_hat_low_quality = x_hat_low_quality[..., :input_len]
-# #                         # --- End Fix ---
-                        
-# #                         x_hat_low_quality = x_hat_low_quality.detach()
-                    
-# #                     # Train diffusion model
-# #                     t = torch.randint(0, model.timesteps, (inputs.shape[0],), device=device).long()
-                    
-# #                     # This line was the source of the "unpack" error
-# #                     # It is now fixed because q_sample returns (x_t, noise)
-# #                     x_t, noise = model.q_sample(x_start=inputs, t=t)
-                    
-# #                     predicted_noise = model.model(x_t, t.float(), cond=x_hat_low_quality)
-# #                     loss = l1_criterion(predicted_noise, noise)
-                    
-# #                     if i % 20 == 19:
-# #                         progress_callback.emit(f"[Epoch {epoch + 1}, Batch {i + 1}] Denoising Loss: {loss.item():.5f}")
-
-# #                 loss.backward()
-# #                 optimizer.step()
-
-# #             progress_callback.emit(f"--- Epoch {epoch + 1} finished ---")
-
-# #         if not stop_event.is_set():
-# #             progress_callback.emit("Training finished. Saving model...")
-# #             torch.save(model.state_dict(), model_save_path)
-# #             progress_callback.emit(f"Model saved to {model_save_path}")
-# #     except Exception as e:
-# #         progress_callback.emit(f"ERROR in training: {e}")
-
-# import torch
-# import torch.nn as nn
-# import torch.optim as optim
-# from torch.utils.data import Dataset, DataLoader
-# import torchaudio
-# import os
-# import numpy as np
-# import torch.nn.functional as F
-# import math
-
-# # --- Perceptual Loss Function ---
-# class MultiResolutionSTFTLoss(nn.Module):
-#     """
-#     Multi-resolution STFT loss, common in audio generation models.
-#     This is a key part of achieving high quality (PESQ/STOI).
-#     """
-#     def __init__(self, fft_sizes=[1024, 2048, 512], hop_sizes=[120, 240, 50], win_lengths=[600, 1200, 240]):
-#         super(MultiResolutionSTFTLoss, self).__init__()
-#         self.fft_sizes = fft_sizes
-#         self.hop_sizes = hop_sizes
-#         self.win_lengths = win_lengths
-#         self.window = torch.hann_window
-#         assert len(fft_sizes) == len(hop_sizes) == len(win_lengths)
-
-#     def forward(self, y_hat, y):
-#         sc_loss, mag_loss = 0.0, 0.0
-#         for fft, hop, win in zip(self.fft_sizes, self.hop_sizes, self.win_lengths):
-#             window = self.window(win, device=y.device)
-#             spec_hat = torch.stft(y_hat.squeeze(1), n_fft=fft, hop_length=hop, win_length=win, window=window, return_complex=True)
-#             spec = torch.stft(y.squeeze(1), n_fft=fft, hop_length=hop, win_length=win, window=window, return_complex=True)
-            
-#             sc_loss += torch.norm(torch.abs(spec) - torch.abs(spec_hat), p='fro') / torch.norm(torch.abs(spec), p='fro')
-#             mag_loss += F.l1_loss(torch.log(torch.abs(spec).clamp(min=1e-9)), torch.log(torch.abs(spec_hat).clamp(min=1e-9)))
-            
-#         return (sc_loss / len(self.fft_sizes)) + (mag_loss / len(self.fft_sizes))
-
-# # --- Causal Convolution ---
-# class CausalConv1d(nn.Conv1d):
-#     """
-#     A 1D convolution that is causal (cannot see the future).
-#     This is critical for the < 20ms latency goal.
-#     """
-#     def __init__(self, *args, **kwargs):
-#         super().__init__(*args, **kwargs)
-#         # Calculate the padding needed to make it causal
-#         self.causal_padding = self.kernel_size[0] - 1
-
-#     def forward(self, x):
-#         # Pad on the left (past) only
-#         return super().forward(F.pad(x, (self.causal_padding, 0)))
-
-# class CausalConvTranspose1d(nn.ConvTranspose1d):
-#     """
-#     A 1D *transpose* convolution that is causal.
-#     It removes output samples that would "see the future".
-#     """
-#     def __init__(self, *args, **kwargs):
-#         super().__init__(*args, **kwargs)
-#         self.causal_padding = self.kernel_size[0] - self.stride[0]
-
-#     def forward(self, x):
-#         x = super().forward(x)
-#         # Remove the invalid, "future-seeing" samples from the end
-#         if self.causal_padding != 0:
-#             return x[..., :-self.causal_padding]
-#         return x
-
-# # --- Vector Quantizer (The heart of the *COMPRESSION*) ---
-# class VectorQuantizer(nn.Module):
-#     """
-#     The Vector Quantizer (VQ) module. This is what enables low-bitrate compression.
-#     It maps continuous latent vectors to a discrete set of "codes" from a codebook.
-#     """
-#     def __init__(self, num_embeddings, embedding_dim, commitment_cost):
-#         super(VectorQuantizer, self).__init__()
-#         self.num_embeddings = num_embeddings # Codebook size (e.g., 256)
-#         self.embedding_dim = embedding_dim # Dimension of each code
-#         self.commitment_cost = commitment_cost # 'beta' in VQ-VAE
-        
-#         # The codebook
-#         self.embedding = nn.Embedding(self.num_embeddings, self.embedding_dim)
-#         self.embedding.weight.data.uniform_(-1.0 / self.num_embeddings, 1.0 / self.num_embeddings)
-
-#     def forward(self, z_e):
-#         # z_e shape: (B, C, T) -> (B*T, C)
-#         z_e_flat = z_e.permute(0, 2, 1).contiguous().view(-1, self.embedding_dim)
-        
-#         # Find the closest codebook vector (L2 distance)
-#         distances = (torch.sum(z_e_flat**2, dim=1, keepdim=True) 
-#                      + torch.sum(self.embedding.weight**2, dim=1)
-#                      - 2 * torch.matmul(z_e_flat, self.embedding.weight.t()))
-        
-#         # Get the indices of the closest vectors
-#         encoding_indices = torch.argmin(distances, dim=1)
-        
-#         # Quantize: Map indices back to codebook vectors
-#         z_q = self.embedding(encoding_indices).view(z_e.shape[0], -1, self.embedding_dim)
-#         z_q = z_q.permute(0, 2, 1).contiguous() # (B, C, T)
-
-#         # VQ-VAE Loss (Commitment Loss)
-#         e_loss = F.mse_loss(z_q.detach(), z_e) * self.commitment_cost
-#         q_loss = F.mse_loss(z_q, z_e.detach())
-#         vq_loss = q_loss + e_loss
-        
-#         # Straight-Through Estimator (STE)
-#         # This copies the gradient from z_q to z_e
-#         z_q = z_e + (z_q - z_e).detach()
-        
-#         return z_q, vq_loss, encoding_indices.view(z_e.shape[0], -1) # (B, T)
-
-# # --- The New Codec Architecture Components ---
-# # These are based on the SoundStream model, but simplified.
-
-# HOP_SIZE = 320 # 20ms frame (320 samples / 16000 Hz = 0.02s)
-# LATENT_DIM = 64
-# VQ_EMBEDDINGS = 256 # 8 bits per code
-# # 16000 bits/sec / 50 frames/sec = 320 bits/frame
-# # 320 bits / 8 bits/index = 40 indices per frame
-# NUM_QUANTIZERS = 40 # This is our 16kbps target (40 bytes * 50 fps = 2000 B/s = 16 kbps)
-
-# class Encoder(nn.Module):
-#     """
-#     Causal encoder. Takes raw audio and produces latent vectors.
-#     Takes a 320-sample chunk and produces 40 latent vectors.
-#     Total stride must be 320 / 40 = 8.
-#     """
-#     def __init__(self):
-#         super().__init__()
-#         self.net = nn.Sequential(
-#             CausalConv1d(1, 32, 7), nn.ELU(),
-#             CausalConv1d(32, 64, 5, stride=2), nn.ELU(), # 320 -> 160
-#             CausalConv1d(64, 64, 5, stride=2), nn.ELU(), # 160 -> 80
-#             CausalConv1d(64, LATENT_DIM, 5, stride=2), nn.ELU() # 80 -> 40
-#         )
-#         # Output shape: (B, LATENT_DIM, 40)
-#         # This is exactly what we need.
-
-#     def forward(self, x):
-#         return self.net(x)
-
-# class Decoder(nn.Module):
-#     """
-#     Causal decoder. Takes quantized latents and reconstructs audio.
-#     Must be the inverse of the Encoder.
-#     """
-#     def __init__(self):
-#         super().__init__()
-#         self.net = nn.Sequential(
-#             CausalConvTranspose1d(LATENT_DIM, 64, 5, stride=2), nn.ELU(), # 40 -> 80
-#             CausalConvTranspose1d(64, 64, 5, stride=2), nn.ELU(), # 80 -> 160
-#             CausalConvTranspose1d(64, 32, 5, stride=2), nn.ELU(), # 160 -> 320
-#             CausalConv1d(32, 1, 7), nn.Tanh() # Final output
-#         )
-    
-#     def forward(self, x):
-#         return self.net(x)
-
-# # --- Causal Transformer (for the Transformer-based Codec) ---
-# class CausalTransformerEncoder(nn.Module):
-#     def __init__(self, d_model, nhead, num_layers):
-#         super().__init__()
-#         self.d_model = d_model
-#         layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
-#         self.transformer = nn.TransformerEncoder(layer, num_layers=num_layers)
-    
-#     def get_causal_mask(self, sz):
-#         # Returns a mask of shape (sz, sz)
-#         # FIX: Create a boolean mask where True means "masked out"
-#         # Create directly as bool to avoid the UserWarning
-#         return torch.triu(torch.ones(sz, sz, dtype=torch.bool), diagonal=1)
-
-#     def forward(self, x, state):
-#         # x shape: (B, T, C) e.g. (1, 40, 64)
-#         # state shape: (B, S, C) e.g. (1, 100, 64)
-        
-#         if state is None:
-#             # First frame, no state
-#             inp = x
-#         else:
-#             # Append new frame to old state
-#             inp = torch.cat([state, x], dim=1)
-        
-#         # We must limit the state size to avoid OOM
-#         # Let's say, 10 frames of history (10 * 40 = 400 steps)
-#         STATE_LEN = 400
-#         if inp.shape[1] > STATE_LEN:
-#             inp = inp[:, -STATE_LEN:, :]
-        
-#         new_state = inp.detach() # The new state is the full input
-        
-#         # Create a causal mask for the *full input sequence*
-#         mask = self.get_causal_mask(inp.shape[1]).to(x.device)
-        
-#         # Process the full sequence
-#         out = self.transformer(inp, mask=mask)
-        
-#         # Only return the *new* frames, corresponding to x
-#         # This is how we make it stateful
-#         out = out[:, -x.shape[1]:, :] # (B, T, C)
-        
-#         return out, new_state
-
-
-# # --- MODEL 1: GRU Codec (Fast) ---
-# class GRU_Codec(nn.Module):
-#     """
-#     A stateful, causal codec using a GRU (RNN) as the core.
-#     This is the "simpler neural approach" and is very fast.
-#     """
-#     def __init__(self):
-#         super().__init__()
-#         self.encoder = Encoder()
-#         self.quantizer = VectorQuantizer(VQ_EMBEDDINGS, LATENT_DIM, 0.25)
-#         self.decoder = Decoder()
-        
-#         self.encoder_rnn = nn.GRU(LATENT_DIM, LATENT_DIM, batch_first=True)
-#         self.decoder_rnn = nn.GRU(LATENT_DIM, LATENT_DIM, batch_first=True)
-    
-#     def forward(self, x, h_enc=None, h_dec=None):
-#         # x: (B, 1, T)
-#         z_e = self.encoder(x) # (B, C, T_latent)
-        
-#         # --- Stateful RNN ---
-#         # (B, C, T_latent) -> (B, T_latent, C)
-#         z_e_rnn_in = z_e.permute(0, 2, 1)
-#         z_e_rnn_out, h_enc_new = self.encoder_rnn(z_e_rnn_in, h_enc)
-#         # (B, T_latent, C) -> (B, C, T_latent)
-#         z_e_rnn_out = z_e_rnn_out.permute(0, 2, 1)
-#         # ---
-        
-#         z_q, vq_loss, indices = self.quantizer(z_e_rnn_out)
-
-#         # --- Stateful RNN ---
-#         # (B, C, T_latent) -> (B, T_latent, C)
-#         z_q_rnn_in = z_q.permute(0, 2, 1)
-#         z_q_rnn_out, h_dec_new = self.decoder_rnn(z_q_rnn_in, h_dec)
-#         # (B, T_latent, C) -> (B, C, T_latent)
-#         z_q_rnn_out = z_q_rnn_out.permute(0, 2, 1)
-#         # ---
-        
-#         x_hat = self.decoder(z_q_rnn_out)
-        
-#         return x_hat, vq_loss, (h_enc_new, h_dec_new)
-
-#     def encode(self, x, h_enc):
-#         """For streaming: encode audio to indices."""
-#         z_e = self.encoder(x) # (B, C, 40)
-#         z_e_rnn_in = z_e.permute(0, 2, 1)
-#         z_e_rnn_out, h_enc_new = self.encoder_rnn(z_e_rnn_in, h_enc)
-#         z_e_rnn_out = z_e_rnn_out.permute(0, 2, 1)
-        
-#         # We don't need vq_loss here, just indices
-#         _, _, indices = self.quantizer(z_e_rnn_out) # (B, 40)
-#         return indices, h_enc_new
-
-#     def decode(self, indices, h_dec):
-#         """For streaming: decode indices to audio."""
-#         # Convert indices (B, 40) to codebook vectors (B, C, 40)
-#         z_q = self.quantizer.embedding(indices) # (B, 40, C)
-#         z_q = z_q.permute(0, 2, 1) # (B, C, 40)
-        
-#         z_q_rnn_in = z_q.permute(0, 2, 1)
-#         z_q_rnn_out, h_dec_new = self.decoder_rnn(z_q_rnn_in, h_dec)
-#         z_q_rnn_out = z_q_rnn_out.permute(0, 2, 1)
-        
-#         x_hat = self.decoder(z_q_rnn_out) # (B, 1, 320)
-#         return x_hat, h_dec_new
-
-
-# # --- MODEL 2: TS3 Codec (Transformer) ---
-# class TS3_Codec(nn.Module):
-#     """
-#     A stateful, causal codec using a Causal Transformer as the core.
-#     This directly addresses your "Transformer" requirement.
-#     """
-#     def __init__(self):
-#         super().__init__()
-#         self.encoder = Encoder()
-#         self.quantizer = VectorQuantizer(VQ_EMBEDDINGS, LATENT_DIM, 0.25)
-#         self.decoder = Decoder()
-        
-#         self.encoder_tfm = CausalTransformerEncoder(LATENT_DIM, nhead=4, num_layers=2)
-#         self.decoder_tfm = CausalTransformerEncoder(LATENT_DIM, nhead=4, num_layers=2)
-    
-#     def forward(self, x, h_enc=None, h_dec=None):
-#         # x: (B, 1, T)
-#         z_e = self.encoder(x) # (B, C, T_latent)
-        
-#         # --- Stateful TFM ---
-#         z_e_tfm_in = z_e.permute(0, 2, 1) # (B, T_latent, C)
-#         z_e_tfm_out, h_enc_new = self.encoder_tfm(z_e_tfm_in, h_enc)
-#         z_e_tfm_out = z_e_tfm_out.permute(0, 2, 1) # (B, C, T_latent)
-#         # ---
-        
-#         z_q, vq_loss, indices = self.quantizer(z_e_tfm_out)
-
-#         # --- Stateful TFM ---
-#         z_q_tfm_in = z_q.permute(0, 2, 1) # (B, T_latent, C)
-#         z_q_tfm_out, h_dec_new = self.decoder_tfm(z_q_tfm_in, h_dec)
-#         z_q_tfm_out = z_q_tfm_out.permute(0, 2, 1) # (B, C, T_latent)
-#         # ---
-        
-#         x_hat = self.decoder(z_q_tfm_out)
-        
-#         return x_hat, vq_loss, (h_enc_new, h_dec_new)
-
-#     def encode(self, x, h_enc):
-#         """For streaming: encode audio to indices."""
-#         z_e = self.encoder(x) # (B, C, 40)
-#         z_e_tfm_in = z_e.permute(0, 2, 1)
-#         z_e_tfm_out, h_enc_new = self.encoder_tfm(z_e_tfm_in, h_enc)
-#         z_e_tfm_out = z_e_tfm_out.permute(0, 2, 1)
-        
-#         _, _, indices = self.quantizer(z_e_tfm_out) # (B, 40)
-#         return indices, h_enc_new
-
-#     def decode(self, indices, h_dec):
-#         """For streaming: decode indices to audio."""
-#         z_q = self.quantizer.embedding(indices) # (B, 40, C)
-        
-#         # TFM model input is (B, 40, C)
-#         z_q_tfm_out, h_dec_new = self.decoder_tfm(z_q, h_dec)
-#         z_q_tfm_out = z_q_tfm_out.permute(0, 2, 1) # (B, C, 40)
-        
-#         x_hat = self.decoder(z_q_tfm_out) # (B, 1, 320)
-#         return x_hat, h_dec_new
-
-# # --- MODEL 3: ScoreDec (Diffusion Post-Filter) ---
-
-# class SinusoidalPosEmb(nn.Module):
-#     def __init__(self, dim):
-#         super().__init__()
-#         self.dim = dim
-
-#     def forward(self, x):
-#         half_dim = self.dim // 2
-#         emb = math.log(10000) / (half_dim - 1)
-#         emb = torch.exp(torch.arange(half_dim, device=x.device) * -emb)
-#         emb = x[:, None] * emb[None, :]
-#         return torch.cat((emb.sin(), emb.cos()), dim=-1)
-
-# class DiffusionBlock(nn.Module):
-#     """A single U-Net block for the diffusion model."""
-#     def __init__(self, in_channels, out_channels, time_emb_dim, cond_dim):
-#         super().__init__()
-#         self.time_mlp = nn.Linear(time_emb_dim, out_channels)
-#         self.cond_mlp = nn.Linear(cond_dim, out_channels)
-        
-#         self.conv1 = CausalConv1d(in_channels, out_channels, kernel_size=3, padding=1)
-#         self.conv2 = CausalConv1d(out_channels, out_channels, kernel_size=3, padding=1)
-#         self.bn1 = nn.BatchNorm1d(out_channels)
-#         self.bn2 = nn.BatchNorm1d(out_channels)
-#         self.relu = nn.ReLU()
-
-#     def forward(self, x, t_emb, cond_emb):
-#         h = self.relu(self.bn1(self.conv1(x)))
-        
-#         # Add time and condition embeddings
-#         time_emb = self.relu(self.time_mlp(t_emb))
-#         cond_emb = self.relu(self.cond_mlp(cond_emb))
-#         h = h + time_emb.unsqueeze(-1) + cond_emb.unsqueeze(-1)
-        
-#         h = self.relu(self.bn2(self.conv2(h)))
-#         return h
-
-# class DiffusionUNet1D(nn.Module):
-#     """
-#     A 1D *CAUSAL* Denoising model, conditioned on the low-quality codec output.
-#     This is a simple "WaveNet" style stack, not a U-Net, to maintain causality.
-#     """
-#     def __init__(self, in_channels=1, model_channels=64, time_emb_dim=256, cond_dim=1):
-#         super().__init__()
-        
-#         # --- Simple Causal Stack ---
-#         self.time_mlp_simple = nn.Sequential(SinusoidalPosEmb(time_emb_dim), nn.Linear(time_emb_dim, model_channels), nn.ReLU())
-#         self.cond_proj_simple = CausalConv1d(cond_dim, model_channels, 1)
-#         self.in_conv = CausalConv1d(in_channels, model_channels, 1)
-        
-#         # FIX: Removed padding=1. CausalConv1d handles its own padding.
-#         # This was the source of the "16002 vs 16000" error.
-#         self.blocks = nn.ModuleList([
-#             CausalConv1d(model_channels, model_channels, 3) for _ in range(4) # 4 residual blocks
-#         ])
-#         self.out_conv = CausalConv1d(model_channels, in_channels, 1)
-#         # --- End Simple Causal Stack ---
-
-#     def forward(self, x, time, cond):
-#         # t_emb shape: (B, C, 1)
-#         t_emb = self.time_mlp_simple(time).unsqueeze(-1) 
-#         # c_emb shape: (B, C, T)
-#         c_emb = self.cond_proj_simple(cond) 
-#         # x_in shape: (B, C, T)
-#         x_in = self.in_conv(x) 
-        
-#         # Add time and condition embeddings
-#         h = x_in + t_emb + c_emb 
-#         for block in self.blocks:
-#             h = block(h) + h # Residual connection
-#         return self.out_conv(h)
-
-# class ScoreDecPostFilter(nn.Module):
-#     """
-#     Wraps the diffusion U-Net and provides the enhancement logic.
-#     This is what is called by the streaming/evaluation tabs.
-#     """
-#     def __init__(self, timesteps=50, model_channels=64):
-#         super().__init__()
-#         self.timesteps = timesteps
-#         self.model = DiffusionUNet1D(model_channels=model_channels)
-        
-#         betas = torch.linspace(1e-4, 0.02, timesteps)
-#         alphas = 1. - betas
-#         alphas_cumprod = torch.cumprod(alphas, axis=0)
-
-#         self.register_buffer('betas', betas)
-#         self.register_buffer('alphas_cumprod', alphas_cumprod)
-#         self.register_buffer('alphas', alphas)
-        
-#     def q_sample(self, x_start, t, noise=None):
-#         """Forward diffusion: noise the clean signal."""
-#         if noise is None: noise = torch.randn_like(x_start)
-#         sqrt_alphas_cumprod_t = self.alphas_cumprod[t].sqrt().view(x_start.shape[0], 1, 1)
-#         sqrt_one_minus_alphas_cumprod_t = (1. - self.alphas_cumprod[t]).sqrt().view(x_start.shape[0], 1, 1)
-        
-#         # FIX: Return both the noised tensor and the noise itself
-#         noised_tensor = sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
-#         return noised_tensor, noise
-
-#     @torch.no_grad()
-#     def p_sample(self, x_t, t, cond):
-#         """One step of the reverse diffusion process."""
-#         t_tensor = torch.full((x_t.shape[0],), t, device=x_t.device, dtype=torch.long)
-#         alpha_t = self.alphas[t].view(-1, 1, 1)
-#         alpha_cumprod_t = self.alphas_cumprod[t].view(-1, 1, 1)
-        
-#         predicted_noise = self.model(x_t, t_tensor.float(), cond)
-        
-#         # DDPM sampling step
-#         x_prev = (x_t - ((1-alpha_t) / (1-alpha_cumprod_t).sqrt()) * predicted_noise) / alpha_t.sqrt()
-        
-#         if t > 0:
-#             noise = torch.randn_like(x_t)
-#             alpha_cumprod_prev_t = self.alphas_cumprod[t-1]
-#             posterior_variance = (1-alpha_cumprod_prev_t) / (1-alpha_cumprod_t) * self.betas[t]
-#             x_prev += torch.sqrt(posterior_variance.view(-1, 1, 1)) * noise
-#         return x_prev
-
-#     @torch.no_grad()
-#     def enhance(self, x_low_quality, timesteps=10):
-#         """
-#         The main enhancement function.
-#         x_low_quality is the output from the GRU_Codec.
-#         This is SLOW and NOT real-time.
-#         """
-#         # Start from the low-quality audio, but add noise
-#         t_start = timesteps - 1
-#         x_t = self.q_sample(x_low_quality, torch.tensor([t_start], device=x_low_quality.device))
-        
-#         for i in reversed(range(timesteps)):
-#             x_t = self.p_sample(x_t, i, cond=x_low_quality)
-            
-#         return torch.tanh(x_t)
-
-
-# # --- TRADITIONAL CODECS (For Baseline Comparison) ---
-# class MuLawCodec:
-#     def __init__(self, quantization_channels=256): self.mu = float(quantization_channels - 1)
-#     def encode(self, x):
-#         mu_t = torch.tensor(self.mu, device=x.device, dtype=torch.float32)
-#         encoded = torch.sign(x) * torch.log1p(mu_t * torch.abs(x)) / torch.log1p(mu_t)
-#         return (((encoded + 1) / 2 * self.mu) + 0.5).to(torch.uint8)
-#     def decode(self, z):
-#         z_float = z.to(torch.float32)
-#         mu_t = torch.tensor(self.mu, device=z.device, dtype=torch.float32)
-#         y = (z_float / self.mu) * 2.0 - 1.0
-#         return (torch.sign(y) * (1.0 / self.mu) * (torch.pow(1.0 + self.mu, torch.abs(y)) - 1.0)).unsqueeze(1)
-
-# class ALawCodec:
-#     def __init__(self): self.A = 87.6
-#     def encode(self, x):
-#         a_t = torch.tensor(self.A, device=x.device, dtype=torch.float32)
-#         abs_x = torch.abs(x)
-#         encoded = torch.zeros_like(x)
-#         cond = abs_x < (1 / self.A)
-#         encoded[cond] = torch.sign(x[cond]) * (a_t * abs_x[cond]) / (1 + torch.log(a_t))
-#         encoded[~cond] = torch.sign(x[~cond]) * (1 + torch.log(a_t * abs_x[~cond])) / (1 + torch.log(a_t))
-#         return (((encoded + 1) / 2 * 255) + 0.5).to(torch.uint8)
-#     def decode(self, z):
-#         z_float = z.to(torch.float32)
-#         a_t = torch.tensor(self.A, device=z.device, dtype=torch.float32)
-#         y = (z_float / 127.5) - 1.0
-#         abs_y = torch.abs(y)
-#         decoded = torch.zeros_like(y)
-#         cond = abs_y < (1 / (1 + torch.log(a_t)))
-#         decoded[cond] = torch.sign(y[cond]) * (abs_y[cond] * (1 + torch.log(a_t))) / a_t
-#         decoded[~cond] = torch.sign(y[~cond]) * torch.exp(abs_y[~cond] * (1 + torch.log(a_t)) - 1) / a_t
-#         return decoded.unsqueeze(1)
-
-# # --- DATASET & TRAINING ---
-# TRAIN_CHUNK_SIZE = 16000 # 1 second
-
-# class AudioChunkDataset(Dataset):
-#     def __init__(self, directory, chunk_size=TRAIN_CHUNK_SIZE, sample_rate=16000):
-#         self.chunk_size, self.sample_rate = chunk_size, sample_rate
-#         self.file_paths = [os.path.join(r, f) for r, _, fs in os.walk(directory) for f in fs if f.lower().endswith(('.wav', '.flac'))]
-#         if not self.file_paths: raise ValueError("No audio files found.")
-#     def __len__(self): return len(self.file_paths)
-#     def __getitem__(self, idx):
-#         try:
-#             waveform, sr = torchaudio.load(self.file_paths[idx])
-#             if sr != self.sample_rate: waveform = torchaudio.transforms.Resample(sr, self.sample_rate)(waveform)
-#             if waveform.shape[0] > 1: waveform = torch.mean(waveform, dim=0, keepdim=True)
-#             if waveform.shape[1] > self.chunk_size:
-#                 start = np.random.randint(0, waveform.shape[1] - self.chunk_size)
-#                 waveform = waveform[:, start:start + self.chunk_size]
-#             else:
-#                 waveform = F.pad(waveform, (0, self.chunk_size - waveform.shape[1]))
-#             return waveform
-#         except Exception as e:
-#             print(f"Warning: Skipping file {self.file_paths[idx]}. Error: {e}")
-#             return torch.zeros((1, self.chunk_size))
-
-# def train_model(dataset_path, epochs, learning_rate, batch_size, model_save_path, progress_callback, stop_event, model_type):
-#     """
-#     Main training function. Now handles 'gru', 'transformer', and 'scoredec' types.
-#     """
-#     try:
-#         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-#         progress_callback.emit(f"Using device: {device}")
-        
-#         dataset = AudioChunkDataset(directory=dataset_path)
-#         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
-#         progress_callback.emit(f"Dataset loaded with {len(dataset)} files.")
-
-#         if model_type == 'gru':
-#             model = GRU_Codec().to(device)
-#             optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-#             stft_criterion = MultiResolutionSTFTLoss().to(device)
-#             l1_criterion = nn.L1Loss().to(device)
-#             progress_callback.emit(f"Starting training for GRU_Codec model...")
-        
-#         elif model_type == 'transformer':
-#             model = TS3_Codec().to(device)
-#             optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-#             stft_criterion = MultiResolutionSTFTLoss().to(device)
-#             l1_criterion = nn.L1Loss().to(device)
-#             progress_callback.emit(f"Starting training for TS3_Codec model...")
-        
-#         elif model_type == 'scoredec':
-#             progress_callback.emit("--- Starting ScoreDec Post-Filter Training ---")
-#             progress_callback.emit("Loading pre-trained GRU_Codec...")
-#             try:
-#                 gru_codec = GRU_Codec().to(device)
-#                 gru_codec.load_state_dict(torch.load("low_latency_codec_gru.pth", map_location=device))
-#                 gru_codec.eval()
-#                 for param in gru_codec.parameters():
-#                     param.requires_grad = False
-#                 progress_callback.emit("GRU_Codec loaded and frozen.")
-#             except FileNotFoundError:
-#                 progress_callback.emit("ERROR: 'low_latency_codec_gru.pth' not found. You must train the GRU_Codec first.")
-#                 return
-            
-#             model = ScoreDecPostFilter().to(device)
-#             optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-#             l1_criterion = nn.L1Loss().to(device)
-#             progress_callback.emit("Starting training for ScoreDec model...")
-            
-#         else:
-#             raise ValueError(f"Unknown model type for training: {model_type}")
-
-#         # --- Main Training Loop ---
-#         for epoch in range(epochs):
-#             if stop_event.is_set():
-#                 progress_callback.emit("Training stopped by user."); break
-            
-#             for i, data in enumerate(dataloader):
-#                 inputs = data.to(device)
-#                 optimizer.zero_grad()
-                
-#                 if model_type in ['gru', 'transformer']:
-#                     h_enc, h_dec = None, None # Reset state per batch
-#                     x_hat, vq_loss, (h_enc, h_dec) = model(inputs, h_enc, h_dec)
-                    
-#                     # --- FIX: Defensively pad output to match input length ---
-#                     # This is the most likely source of the STFT error
-#                     input_len = inputs.shape[-1]
-#                     output_len = x_hat.shape[-1]
-                    
-#                     if output_len < input_len:
-#                         # Pad x_hat on the right if it's shorter
-#                         padding = input_len - output_len
-#                         x_hat = F.pad(x_hat, (0, padding))
-#                     elif output_len > input_len:
-#                         # Trim x_hat if it's longer
-#                         x_hat = x_hat[..., :input_len]
-#                     # --- End Fix ---
-                    
-#                     stft_loss = stft_criterion(x_hat, inputs)
-#                     l1_loss = l1_criterion(x_hat, inputs)
-#                     loss = stft_loss + 0.1 * l1_loss + vq_loss
-                    
-#                     if i % 20 == 19:
-#                         progress_callback.emit(f"[Epoch {epoch + 1}, Batch {i + 1}] Loss: {loss.item():.5f} (STFT: {stft_loss.item():.4f}, VQ: {vq_loss.item():.4f})")
-
-#                 elif model_type == 'scoredec':
-#                     with torch.no_grad():
-#                         x_hat_low_quality, _, _ = gru_codec(inputs)
-                        
-#                         # --- FIX: Ensure low-quality output matches input ---
-#                         input_len = inputs.shape[-1]
-#                         output_len = x_hat_low_quality.shape[-1]
-#                         if output_len < input_len:
-#                             padding = input_len - output_len
-#                             x_hat_low_quality = F.pad(x_hat_low_quality, (0, padding))
-#                         elif output_len > input_len:
-#                             x_hat_low_quality = x_hat_low_quality[..., :input_len]
-#                         # --- End Fix ---
-                        
-#                         x_hat_low_quality = x_hat_low_quality.detach()
-                    
-#                     # Train diffusion model
-#                     t = torch.randint(0, model.timesteps, (inputs.shape[0],), device=device).long()
-                    
-#                     # This line was the source of the "unpack" error
-#                     # It is now fixed because q_sample returns (x_t, noise)
-#                     x_t, noise = model.q_sample(x_start=inputs, t=t)
-                    
-#                     predicted_noise = model.model(x_t, t.float(), cond=x_hat_low_quality)
-#                     loss = l1_criterion(predicted_noise, noise)
-                    
-#                     if i % 20 == 19:
-#                         progress_callback.emit(f"[Epoch {epoch + 1}, Batch {i + 1}] Denoising Loss: {loss.item():.5f}")
-
-#                 loss.backward()
-#                 optimizer.step()
-
-#             progress_callback.emit(f"--- Epoch {epoch + 1} finished ---")
-
-#         if not stop_event.is_set():
-#             progress_callback.emit("Training finished. Saving model...")
-#             torch.save(model.state_dict(), model_save_path)
-#             progress_callback.emit(f"Model saved to {model_save_path}")
-#     except Exception as e:
-#         progress_callback.emit(f"ERROR in training: {e}")
-
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -2558,13 +7,133 @@ import os
 import numpy as np
 import torch.nn.functional as F
 import math
+import librosa
+from pesq import pesq
+from pystoi import stoi
+from torch.optim.lr_scheduler import ExponentialLR
+import traceback
 
-# --- Perceptual Loss Function ---
+# --- Global Configuration (Must match Colab) ---
+HOP_SIZE = 160 # 10ms frame (160 samples / 16000 Hz = 0.01s)
+LATENT_DIM = 128 
+
+VQ_EMBEDDINGS = 256
+NUM_VQ_STAGES = 2 
+VQ_INDICES_PER_STAGE = 10 
+NUM_QUANTIZERS = VQ_INDICES_PER_STAGE # 16 kbps target
+
+# --- DAC INTEGRATION ---
+try:
+    import dac
+    DAC_AVAILABLE = True
+except ImportError:
+    DAC_AVAILABLE = False
+    print("Warning: DAC not available. Install with: pip install descript-audio-codec")
+
+class DACCodec:
+    """Wrapper for Descript Audio Codec (DAC) at 16kHz with 20ms latency"""
+    def __init__(self, model_path=None, model_type="16khz"):
+        if not DAC_AVAILABLE:
+            raise ImportError("DAC is not installed. Install with: pip install descript-audio-codec")
+        
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model_type = model_type
+        
+        # Load DAC model
+        if model_path and os.path.exists(model_path):
+            self.model = dac.DAC.load(model_path)
+        else:
+            try:
+                # Try to download the standard 16kHz model if no path is provided
+                model_path = dac.utils.download(model_type="16khz")
+                self.model = dac.DAC.load(model_path)
+            except:
+                # Fallback in case of multiple download issues
+                self.model = dac.DAC.load(dac.utils.download(model_type="16khz"))
+        
+        self.model.to(self.device)
+        self.model.eval()
+        
+        # DAC 16kHz specs - optimized for low latency
+        self.sample_rate = 16000
+        self.hop_size = 320  # DAC's internal hop size (20ms)
+        self.chunk_size = 320  # 20ms at 16kHz (matches hop size for minimal latency)
+        
+    def encode(self, audio_tensor):
+        """
+        Encode audio to DAC latent codes
+        audio_tensor: (B, 1, T) or (B, T)
+        Returns: codes tensor and original length
+        """
+        with torch.no_grad():
+            # Ensure shape is (B, 1, T)
+            if audio_tensor.dim() == 2:
+                audio_tensor = audio_tensor.unsqueeze(1)
+            elif audio_tensor.dim() == 3 and audio_tensor.shape[1] == 1:
+                pass # Correct shape
+            elif audio_tensor.dim() == 3 and audio_tensor.shape[1] > 1:
+                # Handle multi-channel by taking first channel
+                audio_tensor = audio_tensor[:, :1, :]
+            
+            audio_tensor = audio_tensor.to(self.device, dtype=torch.float32)
+            
+            # Store original length
+            original_length = audio_tensor.shape[-1]
+            
+            # Pad to ensure length is compatible with DAC (must be multiple of hop_size)
+            if original_length < self.hop_size:
+                pad_length = self.hop_size - original_length
+                audio_tensor = F.pad(audio_tensor, (0, pad_length))
+            elif original_length % self.hop_size != 0:
+                pad_length = self.hop_size - (original_length % self.hop_size)
+                audio_tensor = F.pad(audio_tensor, (0, pad_length))
+            
+            # DAC encode: returns (z, codes, latents, commitment_loss, codebook_loss)
+            # We only need 'codes' for discrete representation
+            _, codes, _, _, _ = self.model.encode(audio_tensor)
+            
+            # codes shape: (batch, n_codebooks, sequence_length)
+            return codes, original_length
+    
+    def decode(self, codes, original_length=None):
+        """
+        Decode DAC codes to audio
+        codes: (batch, n_codebooks, sequence_length) discrete codes from encode
+        original_length: original audio length to trim to
+        Returns: (B, 1, T) audio tensor
+        """
+        with torch.no_grad():
+            # Ensure codes is on the right device
+            if not isinstance(codes, torch.Tensor):
+                # DAC codes should typically be torch.LongTensor
+                codes = torch.tensor(codes, dtype=torch.long)
+            codes = codes.to(self.device)
+            
+            # Convert codes back to continuous latent representation
+            z = self.model.quantizer.from_codes(codes)[0]
+            
+            # Decode from latent
+            audio_recon = self.model.decode(z)
+            
+            # Trim to original length if provided
+            # NOTE: DAC.decode might handle trimming if z was derived from a padded tensor, 
+            # but explicit trimming here ensures consistency, especially for chunked data.
+            if original_length is not None and audio_recon.shape[-1] > original_length:
+                audio_recon = audio_recon[..., :original_length]
+            
+            return audio_recon
+    
+    def compress(self, audio_tensor):
+        """Full compression pipeline - returns codes and metadata"""
+        codes, original_length = self.encode(audio_tensor)
+        return codes, original_length
+    
+    def decompress(self, codes, original_length):
+        """Full decompression pipeline"""
+        return self.decode(codes, original_length)
+
+# --- Loss Components ---
 class MultiResolutionSTFTLoss(nn.Module):
-    """
-    Multi-resolution STFT loss, common in audio generation models.
-    This is a key part of achieving high quality (PESQ/STOI).
-    """
     def __init__(self, fft_sizes=[1024, 2048, 512], hop_sizes=[120, 240, 50], win_lengths=[600, 1200, 240]):
         super(MultiResolutionSTFTLoss, self).__init__()
         self.fft_sizes = fft_sizes
@@ -2577,461 +146,264 @@ class MultiResolutionSTFTLoss(nn.Module):
         sc_loss, mag_loss = 0.0, 0.0
         for fft, hop, win in zip(self.fft_sizes, self.hop_sizes, self.win_lengths):
             window = self.window(win, device=y.device)
-            spec_hat = torch.stft(y_hat.squeeze(1), n_fft=fft, hop_length=hop, win_length=win, window=window, return_complex=True)
-            spec = torch.stft(y.squeeze(1), n_fft=fft, hop_length=hop, win_length=win, window=window, return_complex=True)
+            y_hat_float = y_hat.squeeze(1).to(torch.float32)
+            y_float = y.squeeze(1).to(torch.float32)
+            spec_hat = torch.stft(y_hat_float, n_fft=fft, hop_length=hop, win_length=win, window=window, return_complex=True)
+            spec = torch.stft(y_float, n_fft=fft, hop_length=hop, win_length=win, window=window, return_complex=True)
             
-            sc_loss += torch.norm(torch.abs(spec) - torch.abs(spec_hat), p='fro') / torch.norm(torch.abs(spec), p='fro')
+            sc_loss += torch.norm(torch.abs(spec) - torch.abs(spec_hat), p='fro') / (torch.norm(torch.abs(spec), p='fro') + 1e-6)
             mag_loss += F.l1_loss(torch.log(torch.abs(spec).clamp(min=1e-9)), torch.log(torch.abs(spec_hat).clamp(min=1e-9)))
             
         return (sc_loss / len(self.fft_sizes)) + (mag_loss / len(self.fft_sizes))
 
-# --- Causal Convolution ---
+# --- Causal Components ---
 class CausalConv1d(nn.Conv1d):
-    """
-    A 1D convolution that is causal (cannot see the future).
-    This is critical for the < 20ms latency goal.
-    """
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Calculate the padding needed to make it causal
         self.causal_padding = self.kernel_size[0] - 1
-
     def forward(self, x):
-        # Pad on the left (past) only
         return super().forward(F.pad(x, (self.causal_padding, 0)))
 
 class CausalConvTranspose1d(nn.ConvTranspose1d):
-    """
-    A 1D *transpose* convolution that is causal.
-    It removes output samples that would "see the future".
-    """
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.causal_padding = self.kernel_size[0] - self.stride[0]
-
     def forward(self, x):
         x = super().forward(x)
-        # Remove the invalid, "future-seeing" samples from the end
         if self.causal_padding != 0:
             return x[..., :-self.causal_padding]
         return x
 
-# --- Vector Quantizer (The heart of the *COMPRESSION*) ---
-class VectorQuantizer(nn.Module):
-    """
-    The Vector Quantizer (VQ) module. This is what enables low-bitrate compression.
-    It maps continuous latent vectors to a discrete set of "codes" from a codebook.
-    """
-    def __init__(self, num_embeddings, embedding_dim, commitment_cost):
-        super(VectorQuantizer, self).__init__()
-        self.num_embeddings = num_embeddings # Codebook size (e.g., 256)
-        self.embedding_dim = embedding_dim # Dimension of each code
-        self.commitment_cost = commitment_cost # 'beta' in VQ-VAE
+# --- Residual Vector Quantizer (RVQ) ---
+class ResidualVectorQuantizer(nn.Module):
+    def __init__(self, num_stages, num_embeddings, embedding_dim, commitment_cost):
+        super().__init__()
+        self.num_stages = num_stages
+        self.commitment_cost = commitment_cost
+        self.vqs = nn.ModuleList([
+            VectorQuantizerSingle(num_embeddings, embedding_dim, 0.0) 
+            for _ in range(num_stages)
+        ])
+
+    def forward(self, z_e):
+        quantized_output = 0.0 
+        residual = z_e
+        total_vq_loss = 0.0
+        all_indices = []
+
+        for vq in self.vqs:
+            z_q_i, vq_loss_i, indices_i = vq(residual)
+            residual = residual - z_q_i.detach()
+            quantized_output = quantized_output + z_q_i
+            total_vq_loss += vq_loss_i
+            all_indices.append(indices_i)
         
-        # The codebook
+        total_vq_loss = total_vq_loss * self.commitment_cost / self.num_stages
+        return quantized_output, total_vq_loss, torch.stack(all_indices, dim=1) 
+
+class VectorQuantizerSingle(nn.Module):
+    def __init__(self, num_embeddings, embedding_dim, commitment_cost):
+        super().__init__()
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.commitment_cost = commitment_cost
         self.embedding = nn.Embedding(self.num_embeddings, self.embedding_dim)
         self.embedding.weight.data.uniform_(-1.0 / self.num_embeddings, 1.0 / self.num_embeddings)
 
     def forward(self, z_e):
-        # z_e shape: (B, C, T) -> (B*T, C)
-        z_e_flat = z_e.permute(0, 2, 1).contiguous().view(-1, self.embedding_dim)
-        
-        # Find the closest codebook vector (L2 distance)
-        distances = (torch.sum(z_e_flat**2, dim=1, keepdim=True) 
+        z_e_float = z_e.to(torch.float32)
+        z_e_flat = z_e_float.permute(0, 2, 1).contiguous().view(-1, self.embedding_dim)
+        distances = (torch.sum(z_e_flat**2, dim=1, keepdim=True)
                      + torch.sum(self.embedding.weight**2, dim=1)
                      - 2 * torch.matmul(z_e_flat, self.embedding.weight.t()))
-        
-        # Get the indices of the closest vectors
         encoding_indices = torch.argmin(distances, dim=1)
-        
-        # Quantize: Map indices back to codebook vectors
-        z_q = self.embedding(encoding_indices).view(z_e.shape[0], -1, self.embedding_dim)
-        z_q = z_q.permute(0, 2, 1).contiguous() # (B, C, T)
+        z_q = self.embedding(encoding_indices).view(z_e_float.shape[0], -1, self.embedding_dim)
+        z_q = z_q.permute(0, 2, 1).contiguous()
+        e_loss = F.mse_loss(z_q.detach(), z_e_float)
+        z_q = z_e + (z_q - z_e_float).detach()
+        return z_q, e_loss, encoding_indices.view(z_e.shape[0], -1) 
 
-        # VQ-VAE Loss (Commitment Loss)
-        e_loss = F.mse_loss(z_q.detach(), z_e) * self.commitment_cost
-        q_loss = F.mse_loss(z_q, z_e.detach())
-        vq_loss = q_loss + e_loss
-        
-        # Straight-Through Estimator (STE)
-        # This copies the gradient from z_q to z_e
-        z_q = z_e + (z_q - z_e).detach()
-        
-        return z_q, vq_loss, encoding_indices.view(z_e.shape[0], -1) # (B, T)
 
-# --- The New Codec Architecture Components ---
-# These are based on the SoundStream model, but simplified.
-
-HOP_SIZE = 320 # 20ms frame (320 samples / 16000 Hz = 0.02s)
-LATENT_DIM = 64
-VQ_EMBEDDINGS = 256 # 8 bits per code
-# 16000 bits/sec / 50 frames/sec = 320 bits/frame
-# 320 bits / 8 bits/index = 40 indices per frame
-NUM_QUANTIZERS = 40 # This is our 16kbps target (40 bytes * 50 fps = 2000 B/s = 16 kbps)
-
+# --- Encoder/Decoder (16x Downsampling) ---
 class Encoder(nn.Module):
-    """
-    Causal encoder. Takes raw audio and produces latent vectors.
-    Takes a 320-sample chunk and produces 40 latent vectors.
-    Total stride must be 320 / 40 = 8.
-    """
     def __init__(self):
         super().__init__()
+        ResBlock = lambda c: nn.Sequential(CausalConv1d(c, c, 3), nn.ELU(), CausalConv1d(c, c, 1))
         self.net = nn.Sequential(
-            CausalConv1d(1, 32, 7), nn.ELU(),
-            CausalConv1d(32, 64, 5, stride=2), nn.ELU(), # 320 -> 160
-            CausalConv1d(64, 64, 5, stride=2), nn.ELU(), # 160 -> 80
-            CausalConv1d(64, LATENT_DIM, 5, stride=2), nn.ELU() # 80 -> 40
+            CausalConv1d(1, 64, 5), nn.ELU(), ResBlock(64),
+            CausalConv1d(64, 128, 3, stride=2), nn.ELU(), ResBlock(128),
+            CausalConv1d(128, 256, 3, stride=2), nn.ELU(), ResBlock(256),
+            CausalConv1d(256, 512, 3, stride=2), nn.ELU(), ResBlock(512),
+            CausalConv1d(512, 512, 3, stride=2), nn.ELU(), ResBlock(512),
+            CausalConv1d(512, LATENT_DIM, 3, stride=1), nn.ELU(),
         )
-        # Output shape: (B, LATENT_DIM, 40)
-        # This is exactly what we need.
-
-    def forward(self, x):
-        return self.net(x)
+    def forward(self, x): return self.net(x)
 
 class Decoder(nn.Module):
-    """
-    Causal decoder. Takes quantized latents and reconstructs audio.
-    Must be the inverse of the Encoder.
-    """
     def __init__(self):
         super().__init__()
+        ResBlock = lambda c: nn.Sequential(CausalConv1d(c, c, 3), nn.ELU(), CausalConv1d(c, c, 1))
         self.net = nn.Sequential(
-            CausalConvTranspose1d(LATENT_DIM, 64, 5, stride=2), nn.ELU(), # 40 -> 80
-            CausalConvTranspose1d(64, 64, 5, stride=2), nn.ELU(), # 80 -> 160
-            CausalConvTranspose1d(64, 32, 5, stride=2), nn.ELU(), # 160 -> 320
-            CausalConv1d(32, 1, 7), nn.Tanh() # Final output
+            CausalConvTranspose1d(LATENT_DIM, 512, 3, stride=1), nn.ELU(), ResBlock(512),
+            CausalConvTranspose1d(512, 512, 3, stride=2), nn.ELU(), ResBlock(512),
+            CausalConvTranspose1d(512, 256, 3, stride=2), nn.ELU(), ResBlock(256),
+            CausalConvTranspose1d(256, 128, 3, stride=2), nn.ELU(), ResBlock(128),
+            CausalConvTranspose1d(128, 64, 3, stride=2), nn.ELU(), ResBlock(64),
+            CausalConv1d(64, 1, 3), nn.Tanh()
         )
-    
-    def forward(self, x):
-        return self.net(x)
+    def forward(self, x): return self.net(x)
 
-# --- Causal Transformer (for the Transformer-based Codec) ---
+# --- Causal Transformer ---
 class CausalTransformerEncoder(nn.Module):
-    def __init__(self, d_model, nhead, num_layers):
+    def __init__(self, d_model, nhead, num_layers=1, history_chunks=0): 
         super().__init__()
         self.d_model = d_model
-        layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
+        layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True, activation=F.gelu) 
         self.transformer = nn.TransformerEncoder(layer, num_layers=num_layers)
-    
+        self.norm = nn.LayerNorm(d_model)
+        self.state_len = history_chunks * VQ_INDICES_PER_STAGE
+
     def get_causal_mask(self, sz, device):
-        # Returns a mask of shape (sz, sz)
-        # FIX: Create a boolean mask directly on the target device to avoid UserWarning
-        return torch.triu(torch.ones(sz, sz, dtype=torch.bool, device=device), diagonal=1)
+        return torch.triu(torch.ones(sz, sz, device=device), diagonal=1).to(torch.bool)
 
     def forward(self, x, state):
-        # x shape: (B, T, C) e.g. (1, 40, 64)
-        # state shape: (B, S, C) e.g. (1, 100, 64)
-        
-        if state is None:
-            # First frame, no state
-            inp = x
+        if self.state_len > 0 and state is not None:
+            state_history = state[:, -self.state_len:, :]
+            inp = torch.cat([state_history, x], dim=1)
         else:
-            # Append new frame to old state
-            inp = torch.cat([state, x], dim=1)
+            inp = x
         
-        # We must limit the state size to avoid OOM
-        # Let's say, 10 frames of history (10 * 40 = 400 steps)
-        STATE_LEN = 400
-        if inp.shape[1] > STATE_LEN:
-            inp = inp[:, -STATE_LEN:, :]
-        
-        new_state = inp.detach() # The new state is the full input
-        
-        # Create a causal mask for the *full input sequence*
+        new_state = inp.detach()
         mask = self.get_causal_mask(inp.shape[1], x.device)
-        
-        # Process the full sequence
-        out = self.transformer(inp, mask=mask)
-        
-        # Only return the *new* frames, corresponding to x
-        # This is how we make it stateful
-        out = out[:, -x.shape[1]:, :] # (B, T, C)
-        
+        norm_inp = self.norm(inp)
+        out = self.transformer(norm_inp, mask=mask, src_key_padding_mask=None)
+        out = out[:, -x.shape[1]:, :] 
         return out, new_state
 
-
-# --- MODEL 1: GRU Codec (Fast) ---
-class GRU_Codec(nn.Module):
-    """
-    A stateful, causal codec using a GRU (RNN) as the core.
-    This is the "simpler neural approach" and is very fast.
-    """
-    def __init__(self):
-        super().__init__()
-        self.encoder = Encoder()
-        self.quantizer = VectorQuantizer(VQ_EMBEDDINGS, LATENT_DIM, 0.25)
-        self.decoder = Decoder()
-        
-        self.encoder_rnn = nn.GRU(LATENT_DIM, LATENT_DIM, batch_first=True)
-        self.decoder_rnn = nn.GRU(LATENT_DIM, LATENT_DIM, batch_first=True)
-    
-    def forward(self, x, h_enc=None, h_dec=None):
-        # x: (B, 1, T)
-        z_e = self.encoder(x) # (B, C, T_latent)
-        
-        # --- Stateful RNN ---
-        # (B, C, T_latent) -> (B, T_latent, C)
-        z_e_rnn_in = z_e.permute(0, 2, 1)
-        z_e_rnn_out, h_enc_new = self.encoder_rnn(z_e_rnn_in, h_enc)
-        # (B, T_latent, C) -> (B, C, T_latent)
-        z_e_rnn_out = z_e_rnn_out.permute(0, 2, 1)
-        # ---
-        
-        z_q, vq_loss, indices = self.quantizer(z_e_rnn_out)
-
-        # --- Stateful RNN ---
-        # (B, C, T_latent) -> (B, T_latent, C)
-        z_q_rnn_in = z_q.permute(0, 2, 1)
-        z_q_rnn_out, h_dec_new = self.decoder_rnn(z_q_rnn_in, h_dec)
-        # (B, T_latent, C) -> (B, C, T_latent)
-        z_q_rnn_out = z_q_rnn_out.permute(0, 2, 1)
-        # ---
-        
-        x_hat = self.decoder(z_q_rnn_out)
-        
-        return x_hat, vq_loss, (h_enc_new, h_dec_new)
-
-    def encode(self, x, h_enc):
-        """For streaming: encode audio to indices."""
-        z_e = self.encoder(x) # (B, C, 40)
-        z_e_rnn_in = z_e.permute(0, 2, 1)
-        z_e_rnn_out, h_enc_new = self.encoder_rnn(z_e_rnn_in, h_enc)
-        z_e_rnn_out = z_e_rnn_out.permute(0, 2, 1)
-        
-        # We don't need vq_loss here, just indices
-        _, _, indices = self.quantizer(z_e_rnn_out) # (B, 40)
-        return indices, h_enc_new
-
-    def decode(self, indices, h_dec):
-        """For streaming: decode indices to audio."""
-        # Convert indices (B, 40) to codebook vectors (B, C, 40)
-        z_q = self.quantizer.embedding(indices) # (B, 40, C)
-        z_q = z_q.permute(0, 2, 1) # (B, C, 40)
-        
-        z_q_rnn_in = z_q.permute(0, 2, 1)
-        z_q_rnn_out, h_dec_new = self.decoder_rnn(z_q_rnn_in, h_dec)
-        z_q_rnn_out = z_q_rnn_out.permute(0, 2, 1)
-        
-        x_hat = self.decoder(z_q_rnn_out) # (B, 1, 320)
-        return x_hat, h_dec_new
-
-
-# --- MODEL 2: TS3 Codec (Transformer) ---
+# --- Generator: TS3 Codec (RVQ Version) ---
 class TS3_Codec(nn.Module):
-    """
-    A stateful, causal codec using a Causal Transformer as the core.
-    This directly addresses your "Transformer" requirement.
-    """
-    def __init__(self):
+    """The Generator model (GACodec) for streaming."""
+    def __init__(self, history_chunks=0):
         super().__init__()
         self.encoder = Encoder()
-        self.quantizer = VectorQuantizer(VQ_EMBEDDINGS, LATENT_DIM, 0.25)
+        self.quantizer = ResidualVectorQuantizer(NUM_VQ_STAGES, VQ_EMBEDDINGS, LATENT_DIM, 0.25)
+        self.encoder_tfm = CausalTransformerEncoder(LATENT_DIM, nhead=4, num_layers=1, history_chunks=history_chunks)
+        self.decoder_tfm = CausalTransformerEncoder(LATENT_DIM, nhead=4, num_layers=1, history_chunks=history_chunks)
         self.decoder = Decoder()
         
-        self.encoder_tfm = CausalTransformerEncoder(LATENT_DIM, nhead=4, num_layers=2)
-        self.decoder_tfm = CausalTransformerEncoder(LATENT_DIM, nhead=4, num_layers=2)
-    
     def forward(self, x, h_enc=None, h_dec=None):
-        # x: (B, 1, T)
-        z_e = self.encoder(x) # (B, C, T_latent)
-        
-        # --- Stateful TFM ---
-        z_e_tfm_in = z_e.permute(0, 2, 1) # (B, T_latent, C)
-        z_e_tfm_out, h_enc_new = self.encoder_tfm(z_e_tfm_in, h_enc)
-        z_e_tfm_out = z_e_tfm_out.permute(0, 2, 1) # (B, C, T_latent)
-        # ---
-        
-        z_q, vq_loss, indices = self.quantizer(z_e_tfm_out)
-
-        # --- Stateful TFM ---
-        z_q_tfm_in = z_q.permute(0, 2, 1) # (B, T_latent, C)
-        z_q_tfm_out, h_dec_new = self.decoder_tfm(z_q_tfm_in, h_dec)
-        z_q_tfm_out = z_q_tfm_out.permute(0, 2, 1) # (B, C, T_latent)
-        # ---
-        
-        x_hat = self.decoder(z_q_tfm_out)
-        
-        return x_hat, vq_loss, (h_enc_new, h_dec_new)
-
-    def encode(self, x, h_enc):
-        """For streaming: encode audio to indices."""
-        z_e = self.encoder(x) # (B, C, 40)
+        x = x.to(torch.float32) 
+        z_e = self.encoder(x)
         z_e_tfm_in = z_e.permute(0, 2, 1)
         z_e_tfm_out, h_enc_new = self.encoder_tfm(z_e_tfm_in, h_enc)
         z_e_tfm_out = z_e_tfm_out.permute(0, 2, 1)
-        
-        _, _, indices = self.quantizer(z_e_tfm_out) # (B, 40)
-        return indices, h_enc_new
+        z_q, vq_loss, indices = self.quantizer(z_e_tfm_out) 
+        z_q_tfm_in = z_q.permute(0, 2, 1)
+        z_q_tfm_out, h_dec_new = self.decoder_tfm(z_q_tfm_in, h_dec)
+        z_q_tfm_out = z_q_tfm_out.permute(0, 2, 1)
+        x_hat = self.decoder(z_q_tfm_out)
+        return x_hat, vq_loss, (h_enc_new, h_dec_new)
 
-    def decode(self, indices, h_dec):
-        """For streaming: decode indices to audio."""
-        z_q = self.quantizer.embedding(indices) # (B, 40, C)
-        
-        # TFM model input is (B, 40, C)
-        z_q_tfm_out, h_dec_new = self.decoder_tfm(z_q, h_dec)
-        z_q_tfm_out = z_q_tfm_out.permute(0, 2, 1) # (B, C, 40)
-        
-        x_hat = self.decoder(z_q_tfm_out) # (B, 1, 320)
+    def encode(self, x, h_enc=None):
+        """Streaming encode path: output flattened indices (B, 20)."""
+        x = x.to(torch.float32) 
+        z_e = self.encoder(x)
+        z_e_tfm_in = z_e.permute(0, 2, 1)
+        z_e_tfm_out, h_enc_new = self.encoder_tfm(z_e_tfm_in, h_enc)
+        z_e_tfm_out = z_e_tfm_out.permute(0, 2, 1)
+        with torch.no_grad():
+            _, _, indices = self.quantizer(z_e_tfm_out)
+        return indices.view(indices.shape[0], -1), h_enc_new
+
+    def decode(self, indices, h_dec=None):
+        """Streaming decode path: input flattened indices (B, 20)."""
+        indices = indices.view(indices.shape[0], NUM_VQ_STAGES, VQ_INDICES_PER_STAGE)
+        z_q = 0.0
+        for stage in range(NUM_VQ_STAGES):
+            vq_layer = self.quantizer.vqs[stage]
+            indices_i = indices[:, stage, :]
+            # Ensure indices are long/int type for embedding lookup
+            indices_i = indices_i.to(torch.long)
+            z_q_i = vq_layer.embedding(indices_i)
+            z_q = z_q + z_q_i.permute(0, 2, 1)
+            
+        z_q_tfm_in = z_q.permute(0, 2, 1)
+        z_q_tfm_out, h_dec_new = self.decoder_tfm(z_q_tfm_in, h_dec)
+        z_q_tfm_out = z_q_tfm_out.permute(0, 2, 1)
+        x_hat = self.decoder(z_q_tfm_out)
         return x_hat, h_dec_new
 
-# --- MODEL 3: ScoreDec (Diffusion Post-Filter) ---
 
-class SinusoidalPosEmb(nn.Module):
-    def __init__(self, dim):
+# --- Discriminator: Multi-Scale Adversarial Network ---
+class Discriminator(nn.Module):
+    def __init__(self, start_channels=16):
         super().__init__()
-        self.dim = dim
+        self.net = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(1, start_channels, 15, stride=1, padding=7),
+                nn.LeakyReLU(0.2),
+            ),
+            nn.Sequential(nn.Conv1d(start_channels, start_channels * 2, 41, stride=4, padding=20, groups=4), nn.LeakyReLU(0.2)),
+            nn.Sequential(nn.Conv1d(start_channels * 2, start_channels * 4, 41, stride=4, padding=20, groups=16), nn.LeakyReLU(0.2)),
+            nn.Sequential(nn.Conv1d(start_channels * 4, start_channels * 8, 41, stride=4, padding=20, groups=64), nn.LeakyReLU(0.2)),
+            nn.Sequential(nn.Conv1d(start_channels * 8, start_channels * 8, 5, stride=1, padding=2), nn.LeakyReLU(0.2)),
+        ])
+        self.final_conv = nn.Conv1d(start_channels * 8, 1, 3, stride=1, padding=1)
 
     def forward(self, x):
-        half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=x.device) * -emb)
-        emb = x[:, None] * emb[None, :]
-        return torch.cat((emb.sin(), emb.cos()), dim=-1)
+        feature_maps = []
+        for layer in self.net:
+            x = layer(x)
+            feature_maps.append(x)
+        output = self.final_conv(x)
+        feature_maps.append(output)
+        return output, feature_maps
 
-class DiffusionBlock(nn.Module):
-    """A single U-Net block for the diffusion model."""
-    def __init__(self, in_channels, out_channels, time_emb_dim, cond_dim):
+class MultiScaleDiscriminator(nn.Module):
+    def __init__(self):
         super().__init__()
-        self.time_mlp = nn.Linear(time_emb_dim, out_channels)
-        self.cond_mlp = nn.Linear(cond_dim, out_channels)
-        
-        self.conv1 = CausalConv1d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.conv2 = CausalConv1d(out_channels, out_channels, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm1d(out_channels)
-        self.bn2 = nn.BatchNorm1d(out_channels)
-        self.relu = nn.ReLU()
-
-    def forward(self, x, t_emb, cond_emb):
-        h = self.relu(self.bn1(self.conv1(x)))
-        
-        # Add time and condition embeddings
-        time_emb = self.relu(self.time_mlp(t_emb))
-        cond_emb = self.relu(self.cond_mlp(cond_emb))
-        h = h + time_emb.unsqueeze(-1) + cond_emb.unsqueeze(-1)
-        
-        h = self.relu(self.bn2(self.conv2(h)))
-        return h
-
-class DiffusionUNet1D(nn.Module):
-    """
-    A 1D *CAUSAL* Denoising model, conditioned on the low-quality codec output.
-    This is a simple "WaveNet" style stack, not a U-Net, to maintain causality.
-    """
-    def __init__(self, in_channels=1, model_channels=64, time_emb_dim=256, cond_dim=1):
-        super().__init__()
-        
-        # --- Simple Causal Stack ---
-        self.time_mlp_simple = nn.Sequential(SinusoidalPosEmb(time_emb_dim), nn.Linear(time_emb_dim, model_channels), nn.ReLU())
-        self.cond_proj_simple = CausalConv1d(cond_dim, model_channels, 1)
-        self.in_conv = CausalConv1d(in_channels, model_channels, 1)
-        
-        # FIX: Removed padding=1. CausalConv1d handles its own padding.
-        # This was the source of the "16002 vs 16000" error.
-        self.blocks = nn.ModuleList([
-            CausalConv1d(model_channels, model_channels, 3) for _ in range(4) # 4 residual blocks
+        self.discriminators = nn.ModuleList([
+            Discriminator(start_channels=16), 
+            Discriminator(start_channels=32),
+            Discriminator(start_channels=64),
         ])
-        self.out_conv = CausalConv1d(model_channels, in_channels, 1)
-        # --- End Simple Causal Stack ---
+        self.downsample = nn.AvgPool1d(kernel_size=4, stride=2, padding=1, count_include_pad=False)
 
-    def forward(self, x, time, cond):
-        # t_emb shape: (B, C, 1)
-        t_emb = self.time_mlp_simple(time).unsqueeze(-1) 
-        # c_emb shape: (B, C, T)
-        c_emb = self.cond_proj_simple(cond) 
-        # x_in shape: (B, C, T)
-        x_in = self.in_conv(x) 
+    def forward(self, x):
+        outputs = []
+        feature_maps = []
         
-        # Add time and condition embeddings
-        h = x_in + t_emb + c_emb 
-        for block in self.blocks:
-            h = block(h) + h # Residual connection
-        return self.out_conv(h)
+        out_d1, fm_d1 = self.discriminators[0](x)
+        outputs.append(out_d1); feature_maps.append(fm_d1)
 
-class ScoreDecPostFilter(nn.Module):
-    """
-    Wraps the diffusion U-Net and provides the enhancement logic.
-    This is what is called by the streaming/evaluation tabs.
-    """
-    def __init__(self, timesteps=50, model_channels=64):
-        super().__init__()
-        self.timesteps = timesteps
-        self.model = DiffusionUNet1D(model_channels=model_channels)
-        
-        betas = torch.linspace(1e-4, 0.02, timesteps)
-        alphas = 1. - betas
-        alphas_cumprod = torch.cumprod(alphas, axis=0)
+        x_2x = self.downsample(x) 
+        out_d2, fm_d2 = self.discriminators[1](x_2x)
+        outputs.append(out_d2); feature_maps.append(fm_d2)
 
-        self.register_buffer('betas', betas)
-        self.register_buffer('alphas_cumprod', alphas_cumprod)
-        self.register_buffer('alphas', alphas)
-        
-    def q_sample(self, x_start, t, noise=None):
-        """Forward diffusion: noise the clean signal."""
-        if noise is None: noise = torch.randn_like(x_start)
-        sqrt_alphas_cumprod_t = self.alphas_cumprod[t].sqrt().view(x_start.shape[0], 1, 1)
-        sqrt_one_minus_alphas_cumprod_t = (1. - self.alphas_cumprod[t]).sqrt().view(x_start.shape[0], 1, 1)
-        
-        # FIX: Return both the noised tensor and the noise itself
-        noised_tensor = sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
-        return noised_tensor, noise
+        x_4x = self.downsample(x_2x)
+        out_d3, fm_d3 = self.discriminators[2](x_4x)
+        outputs.append(out_d3); feature_maps.append(fm_d3)
 
-    @torch.no_grad()
-    def p_sample(self, x_t, t, cond):
-        """One step of the reverse diffusion process."""
-        t_tensor = torch.full((x_t.shape[0],), t, device=x_t.device, dtype=torch.long)
-        alpha_t = self.alphas[t].view(-1, 1, 1)
-        alpha_cumprod_t = self.alphas_cumprod[t].view(-1, 1, 1)
-        
-        predicted_noise = self.model(x_t, t_tensor.float(), cond)
-        
-        # DDPM sampling step
-        x_prev = (x_t - ((1-alpha_t) / (1-alpha_cumprod_t).sqrt()) * predicted_noise) / alpha_t.sqrt()
-        
-        if t > 0:
-            noise = torch.randn_like(x_t)
-            alpha_cumprod_prev_t = self.alphas_cumprod[t-1]
-            posterior_variance = (1-alpha_cumprod_prev_t) / (1-alpha_cumprod_t) * self.betas[t]
-            x_prev += torch.sqrt(posterior_variance.view(-1, 1, 1)) * noise
-        return x_prev
-
-    @torch.no_grad()
-    def enhance(self, x_low_quality, timesteps=10):
-        """
-        The main enhancement function.
-        x_low_quality is the output from the GRU_Codec.
-        This is SLOW and NOT real-time.
-        """
-        # Start from the low-quality audio, but add noise
-        t_start = timesteps - 1
-        
-        # FIX: Unpack the tuple from q_sample. We only need the noised tensor.
-        # This resolves the "'tuple' object has no attribute 'shape'" error.
-        x_t, _ = self.q_sample(x_low_quality, torch.tensor([t_start], device=x_low_quality.device))
-        
-        for i in reversed(range(timesteps)):
-            x_t = self.p_sample(x_t, i, cond=x_low_quality)
-            
-        return torch.tanh(x_t)
+        return outputs, feature_maps
 
 
-# --- TRADITIONAL CODECS (For Baseline Comparison) ---
+# --- TRADITIONAL CODECS (Baseline Comparison) ---
 class MuLawCodec:
     def __init__(self, quantization_channels=256): self.mu = float(quantization_channels - 1)
     def encode(self, x):
-        mu_t = torch.tensor(self.mu, device=x.device, dtype=torch.float32)
+        mu_t = torch.tensor(self.mu, dtype=torch.float32, device=x.device)
         encoded = torch.sign(x) * torch.log1p(mu_t * torch.abs(x)) / torch.log1p(mu_t)
         return (((encoded + 1) / 2 * self.mu) + 0.5).to(torch.uint8)
     def decode(self, z):
         z_float = z.to(torch.float32)
-        mu_t = torch.tensor(self.mu, device=z.device, dtype=torch.float32)
+        mu_t = torch.tensor(self.mu, dtype=torch.float32, device=z.device)
         y = (z_float / self.mu) * 2.0 - 1.0
         return (torch.sign(y) * (1.0 / self.mu) * (torch.pow(1.0 + self.mu, torch.abs(y)) - 1.0)).unsqueeze(1)
 
 class ALawCodec:
     def __init__(self): self.A = 87.6
     def encode(self, x):
-        a_t = torch.tensor(self.A, device=x.device, dtype=torch.float32)
+        a_t = torch.tensor(self.A, dtype=torch.float32, device=x.device)
         abs_x = torch.abs(x)
         encoded = torch.zeros_like(x)
         cond = abs_x < (1 / self.A)
@@ -3040,7 +412,7 @@ class ALawCodec:
         return (((encoded + 1) / 2 * 255) + 0.5).to(torch.uint8)
     def decode(self, z):
         z_float = z.to(torch.float32)
-        a_t = torch.tensor(self.A, device=z.device, dtype=torch.float32)
+        a_t = torch.tensor(self.A, dtype=torch.float32, device=z.device)
         y = (z_float / 127.5) - 1.0
         abs_y = torch.abs(y)
         decoded = torch.zeros_like(y)
@@ -3049,8 +421,38 @@ class ALawCodec:
         decoded[~cond] = torch.sign(y[~cond]) * torch.exp(abs_y[~cond] * (1 + torch.log(a_t)) - 1) / a_t
         return decoded.unsqueeze(1)
 
-# --- DATASET & TRAINING ---
-TRAIN_CHUNK_SIZE = 16000 # 1 second
+
+# --- TRAINING HELPER FUNCTIONS ---
+
+def generator_loss(disc_fake_features, disc_real_features_for_fm, fm_weight, gan_weight):
+    """Calculates Generator Loss (Adversarial + Feature Matching)."""
+    adv_loss = 0.0
+    fm_loss = 0.0
+    
+    for disc_fake in disc_fake_features:
+        adv_loss += F.mse_loss(disc_fake[-1], torch.ones_like(disc_fake[-1]))
+
+    for (fake_features, real_features) in zip(disc_fake_features, disc_real_features_for_fm):
+        for (fake_feature, real_feature) in zip(fake_features[:-1], real_features[:-1]): 
+            fm_loss += F.l1_loss(fake_feature, real_feature.detach())
+            
+    num_disc = len(disc_fake_features)
+    num_fm_layers = sum(len(f) - 1 for f in disc_fake_features)
+    fm_loss = fm_loss / (num_fm_layers if num_fm_layers > 0 else 1.0)
+    adv_loss = adv_loss / num_disc
+    
+    return adv_loss * gan_weight, fm_loss * fm_weight
+
+def discriminator_loss(disc_real_features, disc_fake_features):
+    """Calculates Discriminator Loss (Real vs Fake)."""
+    loss = 0.0
+    for real_out, fake_out in zip(disc_real_features, disc_fake_features):
+        real_loss = F.mse_loss(real_out[-1], torch.ones_like(real_out[-1]))
+        fake_loss = F.mse_loss(fake_out[-1], torch.zeros_like(fake_out[-1]))
+        loss += (real_loss + fake_loss)
+    return loss / len(disc_real_features)
+
+TRAIN_CHUNK_SIZE = 16000
 
 class AudioChunkDataset(Dataset):
     def __init__(self, directory, chunk_size=TRAIN_CHUNK_SIZE, sample_rate=16000):
@@ -3063,136 +465,114 @@ class AudioChunkDataset(Dataset):
             waveform, sr = torchaudio.load(self.file_paths[idx])
             if sr != self.sample_rate: waveform = torchaudio.transforms.Resample(sr, self.sample_rate)(waveform)
             if waveform.shape[0] > 1: waveform = torch.mean(waveform, dim=0, keepdim=True)
+            waveform = waveform.to(torch.float32)
             if waveform.shape[1] > self.chunk_size:
                 start = np.random.randint(0, waveform.shape[1] - self.chunk_size)
                 waveform = waveform[:, start:start + self.chunk_size]
             else:
                 waveform = F.pad(waveform, (0, self.chunk_size - waveform.shape[1]))
+            if waveform.shape[1] != self.chunk_size:
+                waveform = F.pad(waveform, (0, self.chunk_size - waveform.shape[1]))
             return waveform
         except Exception as e:
             print(f"Warning: Skipping file {self.file_paths[idx]}. Error: {e}")
-            return torch.zeros((1, self.chunk_size))
+            return torch.zeros((1, self.chunk_size), dtype=torch.float32)
 
-def train_model(dataset_path, epochs, learning_rate, batch_size, model_save_path, progress_callback, stop_event, model_type):
-    """
-    Main training function. Now handles 'gru', 'transformer', and 'scoredec' types.
-    """
+def train_model(dataset_path, epochs, learning_rate, batch_size, model_save_path, progress_callback, stop_event, model_type, tfm_history_chunks, disc_warmup_steps, lr_decay_rate, lambda_stft, lambda_fm, d_g_ratio):
+    """Main GAN Training function for the desktop app."""
+    if model_type != 'transformer':
+        progress_callback.emit("ERROR: Only TS3_Codec ('transformer') GAN training is supported."); return
+
     try:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         progress_callback.emit(f"Using device: {device}")
         
-        dataset = AudioChunkDataset(directory=dataset_path)
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
-        progress_callback.emit(f"Dataset loaded with {len(dataset)} files.")
+        train_dataset = AudioChunkDataset(directory=dataset_path)
+        train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True, drop_last=True)
+        progress_callback.emit(f"Train Dataset loaded with {len(train_dataset)} files.")
 
-        if model_type == 'gru':
-            model = GRU_Codec().to(device)
-            optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-            stft_criterion = MultiResolutionSTFTLoss().to(device)
-            l1_criterion = nn.L1Loss().to(device)
-            progress_callback.emit(f"Starting training for GRU_Codec model...")
-        
-        elif model_type == 'transformer':
-            model = TS3_Codec().to(device)
-            optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-            stft_criterion = MultiResolutionSTFTLoss().to(device)
-            l1_criterion = nn.L1Loss().to(device)
-            progress_callback.emit(f"Starting training for TS3_Codec model...")
-        
-        elif model_type == 'scoredec':
-            progress_callback.emit("--- Starting ScoreDec Post-Filter Training ---")
-            progress_callback.emit("Loading pre-trained GRU_Codec...")
-            try:
-                gru_codec = GRU_Codec().to(device)
-                gru_codec.load_state_dict(torch.load("low_latency_codec_gru.pth", map_location=device))
-                gru_codec.eval()
-                for param in gru_codec.parameters():
-                    param.requires_grad = False
-                progress_callback.emit("GRU_Codec loaded and frozen.")
-            except FileNotFoundError:
-                progress_callback.emit("ERROR: 'low_latency_codec_gru.pth' not found. You must train the GRU_Codec first.")
-                return
-            
-            model = ScoreDecPostFilter().to(device)
-            optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-            l1_criterion = nn.L1Loss().to(device)
-            progress_callback.emit("Starting training for ScoreDec model...")
-            
-        else:
-            raise ValueError(f"Unknown model type for training: {model_type}")
+        generator = TS3_Codec(history_chunks=tfm_history_chunks).to(device)
+        discriminator = MultiScaleDiscriminator().to(device)
 
-        # --- Main Training Loop ---
+        optimizer_g = optim.Adam(generator.parameters(), lr=learning_rate, betas=(0.5, 0.9))
+        optimizer_d = optim.Adam(discriminator.parameters(), lr=learning_rate, betas=(0.5, 0.9))
+        
+        scheduler_g = ExponentialLR(optimizer_g, gamma=lr_decay_rate)
+        scheduler_d = ExponentialLR(optimizer_d, gamma=lr_decay_rate)
+
+        stft_criterion = MultiResolutionSTFTLoss().to(device)
+        l1_criterion = nn.L1Loss().to(device)
+        
+        progress_callback.emit(f"Starting GAN training for TS3_Codec...")
+        
+        # Hyperparameters for Loss (L1, VQ are defaults)
+        lambda_l1, lambda_vq = 1.0, 0.1
+        gan_weight, fm_weight = 1.0, lambda_fm
+        global_step = 0
+        d_step_counter = 0
+
         for epoch in range(epochs):
             if stop_event.is_set():
                 progress_callback.emit("Training stopped by user."); break
             
-            for i, data in enumerate(dataloader):
+            generator.train(); discriminator.train()
+            
+            for i, data in enumerate(train_dataloader):
+                if stop_event.is_set(): break
                 inputs = data.to(device)
-                optimizer.zero_grad()
+                global_step += 1
+                d_step_counter += 1
+
+                if d_step_counter % d_g_ratio == 0:
+                    # --- Train Discriminator ---
+                    optimizer_d.zero_grad()
+                    x_hat, _, _ = generator(inputs)
+                    x_hat_detached = x_hat.detach()
+                    
+                    _, disc_real_features = discriminator(inputs)
+                    _, disc_fake_features = discriminator(x_hat_detached)
+                    loss_d_total = discriminator_loss(disc_real_features, disc_fake_features)
+
+                    loss_d_total.backward()
+                    optimizer_d.step()
+                    scheduler_d.step()
                 
-                if model_type in ['gru', 'transformer']:
-                    h_enc, h_dec = None, None # Reset state per batch
-                    x_hat, vq_loss, (h_enc, h_dec) = model(inputs, h_enc, h_dec)
+                if global_step > disc_warmup_steps:
+                    # --- Train Generator ---
+                    optimizer_g.zero_grad()
                     
-                    # --- FIX: Defensively pad output to match input length ---
-                    # This is the most likely source of the STFT error
-                    input_len = inputs.shape[-1]
-                    output_len = x_hat.shape[-1]
-                    
-                    if output_len < input_len:
-                        # Pad x_hat on the right if it's shorter
-                        padding = input_len - output_len
-                        x_hat = F.pad(x_hat, (0, padding))
-                    elif output_len > input_len:
-                        # Trim x_hat if it's longer
-                        x_hat = x_hat[..., :input_len]
-                    # --- End Fix ---
-                    
+                    x_hat, vq_loss, _ = generator(inputs)
                     stft_loss = stft_criterion(x_hat, inputs)
                     l1_loss = l1_criterion(x_hat, inputs)
-                    loss = stft_loss + 0.1 * l1_loss + vq_loss
-                    
-                    if i % 20 == 19:
-                        progress_callback.emit(f"[Epoch {epoch + 1}, Batch {i + 1}] Loss: {loss.item():.5f} (STFT: {stft_loss.item():.4f}, VQ: {vq_loss.item():.4f})")
 
-                elif model_type == 'scoredec':
+                    disc_fake_outputs_g, disc_fake_features_g = discriminator(x_hat)
                     with torch.no_grad():
-                        x_hat_low_quality, _, _ = gru_codec(inputs)
-                        
-                        # --- FIX: Ensure low-quality output matches input ---
-                        input_len = inputs.shape[-1]
-                        output_len = x_hat_low_quality.shape[-1]
-                        if output_len < input_len:
-                            padding = input_len - output_len
-                            x_hat_low_quality = F.pad(x_hat_low_quality, (0, padding))
-                        elif output_len > input_len:
-                            x_hat_low_quality = x_hat_low_quality[..., :input_len]
-                        # --- End Fix ---
-                        
-                        x_hat_low_quality = x_hat_low_quality.detach()
+                        _, disc_real_features_for_fm = discriminator(inputs)
                     
-                    # Train diffusion model
-                    t = torch.randint(0, model.timesteps, (inputs.shape[0],), device=device).long()
+                    adv_loss, fm_loss = generator_loss(disc_fake_features_g, disc_real_features_for_fm, fm_weight=fm_weight, gan_weight=gan_weight)
                     
-                    # This line was the source of the "unpack" error
-                    # It is now fixed because q_sample returns (x_t, noise)
-                    x_t, noise = model.q_sample(x_start=inputs, t=t)
-                    
-                    predicted_noise = model.model(x_t, t.float(), cond=x_hat_low_quality)
-                    loss = l1_criterion(predicted_noise, noise)
-                    
-                    if i % 20 == 19:
-                        progress_callback.emit(f"[Epoch {epoch + 1}, Batch {i + 1}] Denoising Loss: {loss.item():.5f}")
+                    loss_g_total = ((adv_loss + fm_loss) + 
+                                    lambda_stft * stft_loss + 
+                                    lambda_l1 * l1_loss + 
+                                    lambda_vq * vq_loss)
 
-                loss.backward()
-                optimizer.step()
+                    loss_g_total.backward()
+                    optimizer_g.step()
+                    scheduler_g.step()
 
+                    if global_step % 20 == 19:
+                        # Ensure d_step_counter has run at least once for a meaningful D loss
+                        d_loss_item = loss_d_total.item() if 'loss_d_total' in locals() else float('nan')
+                        progress_callback.emit(
+                            f"[E {epoch + 1}, B {i + 1}] G Loss: {loss_g_total.item():.4f} (Adv: {adv_loss.item():.4f}, FM: {fm_loss.item():.4f}, STFT: {stft_loss.item():.4f}) | D Loss: {d_loss_item:.4f}"
+                        )
+            
             progress_callback.emit(f"--- Epoch {epoch + 1} finished ---")
 
         if not stop_event.is_set():
-            progress_callback.emit("Training finished. Saving model...")
-            torch.save(model.state_dict(), model_save_path)
-            progress_callback.emit(f"Model saved to {model_save_path}")
+            progress_callback.emit("Training finished. Saving Generator...")
+            torch.save(generator.state_dict(), model_save_path)
+            progress_callback.emit(f"Generator saved to {model_save_path}")
     except Exception as e:
         progress_callback.emit(f"ERROR in training: {e}")
-
+        progress_callback.emit(traceback.format_exc())
