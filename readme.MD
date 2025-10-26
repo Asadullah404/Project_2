@@ -103,8 +103,8 @@ Python Environment Setup
 The application automatically checks for most dependencies, but manually setting up the core environment is recommended:
 
 # Clone the repository
-git clone [YOUR_REPOSITORY_URL]
-cd [YOUR_REPOSITORY_NAME]
+git clone https://github.com/Asadullah404/Project_2
+cd Pro
 
 # Install PyTorch (ensure this matches your CUDA version if using GPU)
 # Example for CUDA 12.1:
