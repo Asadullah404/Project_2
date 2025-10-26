@@ -1,0 +1,131 @@
+Project 2: Ultra Low-Latency Neural Audio Coding for Real-Time Teleconferencing
+
+🎙️ Project Overview
+
+This project focuses on the development and real-time demonstration of a novel Neural Audio Codec designed for ultra low-latency teleconferencing applications. Leveraging advanced deep learning architectures, specifically a Causal VQ-VAE with a Transformer bottleneck, the system aims to achieve high-quality speech compression at extremely low bitrates, drastically outperforming conventional codecs in efficiency while maintaining real-time performance.
+
+🎯 Objectives
+
+The core objectives guiding this research and development project are:
+
+Low-Latency Coder Development: Develop a low-latency neural audio coder, focusing on a Causal VQ-VAE architecture enhanced with Transformers.
+
+Performance Efficiency: Achieve low-latency, high-quality audio compression at low bitrates (targeting 8–16 kbps) crucial for real-time communication.
+
+Comparative Analysis: Compare the performance of the custom neural codec against established traditional codecs (like $\mu$-Law and A-Law) and modern neural baselines (like DAC and EnCodec).
+
+Insights & Trade-offs: Provide insights into the complex trade-offs between model complexity, end-to-end latency, and reconstructed audio quality.
+
+✨ Core Features & Application Functionality
+
+The provided Python application is a comprehensive suite built using PyQt5 for demonstration, real-time testing, and quantitative evaluation.
+
+1. Model Architecture
+
+Custom Codec: Implements a Tiny Transformer Codec—a Causal VQ-VAE architecture utilizing multiple convolutional downsampling blocks followed by a causal Transformer network in the bottleneck for improved temporal modeling of latent codes.
+
+VQ Quantization: Uses Vector Quantization (VQ) with multiple codebooks to produce highly compressed integer indices for transmission.
+
+2. Real-Time Streaming Tab
+
+Peer Discovery: Automatically discovers other running instances on the local network (UDP broadcast).
+
+Live Encoding/Decoding: Captures live microphone audio, encodes it using the selected codec (including the custom VQ-Codec), streams the compressed data over UDP to a peer, and decodes/plays back the incoming stream in real time.
+
+Codec Comparison: Allows live switching between Uncompressed, $\mu$-Law, A-Law, DAC, EnCodec, and the Tiny Transformer Codec to observe real-world performance differences.
+
+File Playback: Enables encoding and streaming of local audio files instead of the microphone input.
+
+3. Model Evaluation Tab
+
+Quantitative Metrics: Calculates key speech quality metrics on local audio files:
+
+PESQ (Perceptual Evaluation of Speech Quality)
+
+STOI (Short-Time Objective Intelligibility)
+
+Real-Time Factor (RTF): Measures the codec's processing speed against the audio duration to verify real-time operability on the host machine.
+
+Visual Analysis: Generates side-by-side spectrograms of the original and reconstructed audio for visual comparison of quality and noise reduction.
+
+📊 Evaluation Criteria & Performance Targets
+
+Metric
+
+Target
+
+Description
+
+End-to-End Latency
+
+$< 20 \text{ ms}$
+
+Crucial for two-way, natural conversations.
+
+Bitrate
+
+$8 - 16 \text{ kbps}$
+
+Achieved by VQ-quantizing Transformer latent features.
+
+PESQ (Wideband)
+
+$\ge 3.5$
+
+Target for high perceptual quality (Max 4.5).
+
+STOI
+
+$\ge 0.9$
+
+Target for high speech intelligibility (Max 1.0).
+
+Prototype Execution
+
+Real-time RTF $< 1.0$
+
+Ensures the system is runnable on standard hardware (PC/Laptop).
+
+🛠️ Installation and Setup
+
+This project requires Python 3.8+ and relies heavily on PyTorch and system audio I/O libraries.
+
+Prerequisites
+
+You must have the following system libraries/packages installed:
+
+A functional C/C++ compiler environment (e.g., build tools for Visual Studio on Windows, gcc on Linux/macOS) is often required for pyaudio, pesq, and pystoi.
+
+A CUDA-enabled GPU is highly recommended for real-time performance of the neural codecs.
+
+Python Environment Setup
+
+The application automatically checks for most dependencies, but manually setting up the core environment is recommended:
+
+# Clone the repository
+git clone [YOUR_REPOSITORY_URL]
+cd [YOUR_REPOSITORY_NAME]
+
+# Install PyTorch (ensure this matches your CUDA version if using GPU)
+# Example for CUDA 12.1:
+# pip install torch torchvision torchaudio --index-url [https://download.pytorch.org/whl/cu121](https://download.pytorch.org/whl/cu121)
+
+# Install core dependencies (pyaudio often requires manual install or specific system packages)
+pip install numpy scipy librosa matplotlib soundfile
+
+# Install codec and metric libraries
+pip install pesq pystoi
+pip install descript-audio-codec # DAC
+pip install encodec einops
+
+
+Running the Application
+
+Acquire Trained Weights: Ensure you have the trained weights for the custom Tiny Transformer Codec (best_model.pth or similar) generated by the companion trainer script.
+
+Execute Main App:
+
+python app.py
+
+
+Load Codec: In the Real-Time Streaming or Model Evaluation tab, select the "Tiny Transformer Codec" and provide the path to your trained .pth file before starting streaming or evaluation.
